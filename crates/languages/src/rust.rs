@@ -1806,8 +1806,7 @@ mod tests {
                 vec![
                     (10..13, HighlightId::TABSTOP_INSERT_ID),
                     (16..19, HighlightId::TABSTOP_INSERT_ID),
-                    (0..7, HighlightId::new(2)),
-                    (7..8, HighlightId::new(2)),
+                    (0..8, HighlightId::new(2)),
                 ],
             ))
         );
@@ -1834,8 +1833,7 @@ mod tests {
                 0..4,
                 vec![
                     (5..9, HighlightId::TABSTOP_REPLACE_ID),
-                    (0..3, HighlightId::new(2)),
-                    (3..4, HighlightId::new(2)),
+                    (0..4, HighlightId::new(2)),
                 ],
             ))
         );
@@ -1920,8 +1918,7 @@ mod tests {
                 vec![
                     (15..20, HighlightId::TABSTOP_REPLACE_ID),
                     (16..19, HighlightId::TABSTOP_INSERT_ID),
-                    (0..13, HighlightId::new(2)),
-                    (13..14, HighlightId::new(2)),
+                    (0..14, HighlightId::new(2)),
                 ],
             ))
         );
