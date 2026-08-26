@@ -168,6 +168,10 @@ impl BlameRenderer for GitBlameRenderer {
         let short_commit_id = blame_entry.sha.display_short();
         let author_name = blame_entry.author.as_deref().unwrap_or("<no name>");
         let name = util::truncate_and_trailoff(author_name, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED);
+        let is_highlighted = editor
+            .read(cx)
+            .blame()
+            .is_some_and(|blame| blame.read(cx).highlighted_sha() == Some(blame_entry.sha));
         let age_background = blame_entry_age_background(&blame_entry, sha_color, cx);
 
         let avatar = if ProjectSettings::get_global(cx).git.blame.show_avatar {
@@ -205,6 +209,9 @@ impl BlameRenderer for GitBlameRenderer {
                         .line_height(style.line_height)
                         .text_color(cx.theme().status().hint)
                         .when_some(age_background, |this, background| this.bg(background))
+                        .when(is_highlighted, |this| {
+                            this.bg(cx.theme().colors().element_selected)
+                        })
                         .child(
                             h_flex()
                                 .gap_2()
@@ -823,5 +830,26 @@ mod tests {
         assert!(blame_age_alpha(one_hour) > blame_age_alpha(two_days));
         assert!(blame_age_alpha(two_days) > blame_age_alpha(two_weeks));
         assert!(blame_age_alpha(two_weeks) > blame_age_alpha(two_years));
+    }
+
+    #[test]
+    fn blame_age_alpha_boundary_values() {
+        const HOUR: i64 = 60 * 60;
+        const DAY: i64 = 24 * HOUR;
+        const WEEK: i64 = 7 * DAY;
+        const YEAR: i64 = 365 * DAY;
+
+        assert_eq!(blame_age_alpha(0), 1.0);
+        assert_eq!(blame_age_alpha(HOUR - 1), 1.0);
+        assert_eq!(blame_age_alpha(HOUR), 0.9);
+        assert_eq!(blame_age_alpha(DAY), 0.75);
+        assert_eq!(blame_age_alpha(WEEK), 0.6);
+        assert_eq!(blame_age_alpha(YEAR), 0.0);
+    }
+
+    #[test]
+    fn blame_age_alpha_future_timestamp_is_max() {
+        assert_eq!(blame_age_alpha(-1), 1.0);
+        assert_eq!(blame_age_alpha(-365 * 24 * 60 * 60), 1.0);
     }
 }
