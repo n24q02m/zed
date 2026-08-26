@@ -1,3 +1,5 @@
+> [!IMPORTANT]
+> Remove this line to confirm you have reviewed this PR before submitting.
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
