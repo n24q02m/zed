@@ -1,0 +1,56 @@
+# Verify workflow for n24q02m/zed fork — targeted git UI tests
+# Mục đích: chạy đúng bài test upstream (cargo test -p git_ui -p git + clippy) trên GitHub-hosted
+# runner thay vì namespace-profile runners của upstream. Dùng làm gate trước khi mở PR về zed-industries/zed.
+name: git-ui-verify
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**git**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CC: clang
+  CXX: clang++
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Linux dependencies (upstream ./script/linux)
+        run: ./script/linux
+
+      # rustup đọc rust-toolchain.toml của repo và tự cài đúng toolchain pin
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Build git crates
+        run: cargo build -p git -p git_ui --quiet
+
+      - name: Run git crate tests
+        run: cargo test -p git -p git_ui --quiet
+
+      # Rustfmt không cần linker — luôn chạy được local lẫn CI
+      - name: Format check
+        run: cargo fmt --check -p git -p git_ui
+
+  clippy-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - name: Install Linux dependencies
+        run: ./script/linux
+      # Quy tắc repo: dùng ./script/clippy, KHÔNG gọi cargo clippy trực tiếp
+      - name: Clippy (repo script)
+        run: ./script/clippy
