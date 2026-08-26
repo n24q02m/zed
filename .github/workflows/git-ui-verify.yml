@@ -6,7 +6,7 @@ name: git-ui-verify
 on:
   workflow_dispatch:
   push:
-    branches: ["**git**"]
+    branches: ["**"]
 
 env:
   CARGO_TERM_COLOR: always
