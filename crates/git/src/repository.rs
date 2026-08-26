@@ -5179,6 +5179,59 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_initial_graph_data_selection_follows_rename(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+
+        // Commit 1: create the file that will later be renamed.
+        fs::write(repo_dir.path().join("renamed-1.txt"), "alpha\nbeta\n").unwrap();
+        git_command(repo_dir.path(), ["add", "renamed-1.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "add renamed-1"]);
+
+        // Commit 2: rename without touching content.
+        git_command(repo_dir.path(), ["mv", "renamed-1.txt", "renamed-2.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "rename file"]);
+
+        // Commit 3: edit first line after the rename.
+        fs::write(
+            repo_dir.path().join("renamed-2.txt"),
+            "alpha changed\nbeta\n",
+        )
+        .unwrap();
+        git_command(repo_dir.path(), ["commit", "-am", "edit alpha"]);
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let (request_tx, request_rx) = async_channel::unbounded();
+
+        repo.initial_graph_data(
+            LogSource::Selection {
+                path: RepoPath::new("renamed-2.txt").unwrap(),
+                start_line: 1,
+                end_line: 1,
+            },
+            LogOrder::DateOrder,
+            request_tx,
+        )
+        .await
+        .unwrap();
+
+        let graph_data = request_rx.recv().await.unwrap();
+        // `git log -L` follows the rename: line "alpha" originates in commit
+        // 1 and was last edited by commit 3; the pure rename commit is skipped.
+        assert_eq!(graph_data.len(), 2);
+    }
+
+    #[gpui::test]
     async fn test_initial_graph_data_selection_preserves_git_error(cx: &mut TestAppContext) {
         disable_git_global_config();
         cx.executor().allow_parking();
