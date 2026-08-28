@@ -14027,7 +14027,10 @@ mod tests {
         );
 
         assert_eq!(selected, Some(first.clone()));
-        assert_eq!(marked, vec![duplicate_path_other_repo, remaining, first]);
+        assert_eq!(
+            marked,
+            vec![duplicate_path_other_repo, remaining, first.clone()]
+        );
         assert_eq!(anchor, Some(first));
     }
 
@@ -14148,6 +14151,6 @@ mod tests {
 
         assert_eq!(selected, Some(second));
         assert_eq!(marked, vec![first, third]);
-        assert_eq!(anchor, Some(second));
+        assert_eq!(anchor, Some(second.clone()));
     }
 }
