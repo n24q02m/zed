@@ -1588,7 +1588,7 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(git_repo) = self.active_repository.as_ref() else {
+        let Some(git_repo) = self.active_repository.clone() else {
             return;
         };
 
@@ -5405,9 +5405,12 @@ impl GitPanel {
                 &visible,
             );
             self.selected_entry = selected_entry_id.as_ref().and_then(|entry| {
-                self.entries.iter().position(|candidate| {
-                    self.entry_identity(candidate, repo_id).as_ref() == Some(entry)
-                })
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .position(|(index, _candidate)| {
+                        self.entry_identity(index, repo_id).as_ref() == Some(entry)
+                    })
             });
         }
         self.selected_entry_id = selected_entry_id;
@@ -8277,12 +8280,6 @@ impl GitPanel {
         cx: &Context<Self>,
     ) -> AnyElement {
         let selected = self.selected_entry == Some(ix);
-        let marked = self
-            .active_repository
-            .as_ref()
-            .map(|repo| repo.read(cx).id)
-            .and_then(|repo_id| self.entry_identity(ix, repo_id))
-            .is_some_and(|entry| self.marked_entries.contains(&entry));
         let label_color = Color::Muted;
 
         let id: ElementId = ElementId::Name(format!("dir_{}_{}", entry.name, ix).into());
