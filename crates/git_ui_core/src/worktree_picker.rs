@@ -2313,4 +2313,177 @@ mod tests {
             "removing the worktree from the window should not delete the git worktree"
         );
     }
+    #[test]
+    fn worktree_picker_view_model_keeps_stable_order_and_all_context() {
+        let repository_one = project::git_store::RepositoryId(7);
+        let repository_two = project::git_store::RepositoryId(8);
+        let repository_one_identity = PathBuf::from("/repos/one/app");
+        let repository_two_identity = PathBuf::from("/repos/two/app");
+        let make_worktree = |repository: &str, name: &str, branch: Option<&str>, is_main: bool| {
+            GitWorktree {
+                path: PathBuf::from(format!("/repos/{repository}/{name}")),
+                ref_name: branch.map(|branch| format!("refs/heads/{branch}").into()),
+                sha: "0123456789abcdef".into(),
+                is_main,
+                is_bare: false,
+            }
+        };
+        let status = |repository_id, repository_identity_path, is_dirty, ahead, behind| {
+            WorktreePickerStatus {
+                repository_id,
+                repository_identity_path,
+                is_dirty,
+                ahead,
+                behind,
+            }
+        };
+
+        let rows = build_worktree_picker_view_model(vec![
+            (
+                make_worktree("one", "behind", Some("behind"), false),
+                status(repository_one, repository_one_identity.clone(), Some(false), Some(0), Some(3)),
+            ),
+            (
+                make_worktree("one", "detached", None, false),
+                status(repository_one, repository_one_identity.clone(), Some(false), None, None),
+            ),
+            (
+                make_worktree("one", "dirty", Some("dirty"), false),
+                status(repository_one, repository_one_identity.clone(), Some(true), Some(0), Some(0)),
+            ),
+            (
+                make_worktree("one", "ahead", Some("ahead"), false),
+                status(repository_one, repository_one_identity.clone(), Some(false), Some(4), Some(0)),
+            ),
+            (
+                make_worktree("one", "main", Some("main"), true),
+                status(repository_one, repository_one_identity.clone(), Some(false), Some(0), Some(0)),
+            ),
+            (
+                make_worktree("one", "missing-upstream", Some("local"), false),
+                status(repository_one, repository_one_identity.clone(), Some(false), None, None),
+            ),
+            (
+                make_worktree("one", "shared", Some("shared"), false),
+                status(repository_one, repository_one_identity.clone(), Some(false), Some(1), Some(2)),
+            ),
+            (
+                make_worktree("two", "shared", Some("shared"), false),
+                status(repository_two, repository_two_identity.clone(), Some(true), Some(3), Some(0)),
+            ),
+        ]);
+
+        let context = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.worktree.directory_name(Some(&row.status.repository_identity_path)),
+                    row.worktree.branch_name().map(str::to_owned),
+                    row.worktree.path.clone(),
+                    row.status.repository_id,
+                    row.status.repository_identity_path.clone(),
+                    row.status.is_dirty,
+                    row.status.ahead,
+                    row.status.behind,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            context,
+            vec![
+                (
+                    "ahead".to_string(),
+                    Some("ahead".to_string()),
+                    PathBuf::from("/repos/one/ahead"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(4),
+                    Some(0),
+                ),
+                (
+                    "behind".to_string(),
+                    Some("behind".to_string()),
+                    PathBuf::from("/repos/one/behind"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(3),
+                ),
+                (
+                    "detached".to_string(),
+                    None,
+                    PathBuf::from("/repos/one/detached"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
+                (
+                    "dirty".to_string(),
+                    Some("dirty".to_string()),
+                    PathBuf::from("/repos/one/dirty"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(true),
+                    Some(0),
+                    Some(0),
+                ),
+                (
+                    "main worktree".to_string(),
+                    Some("main".to_string()),
+                    PathBuf::from("/repos/one/main"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(0),
+                ),
+                (
+                    "missing-upstream".to_string(),
+                    Some("local".to_string()),
+                    PathBuf::from("/repos/one/missing-upstream"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
+                (
+                    "shared".to_string(),
+                    Some("shared".to_string()),
+                    PathBuf::from("/repos/one/shared"),
+                    repository_one,
+                    repository_one_identity,
+                    Some(false),
+                    Some(1),
+                    Some(2),
+                ),
+                (
+                    "shared".to_string(),
+                    Some("shared".to_string()),
+                    PathBuf::from("/repos/two/shared"),
+                    repository_two,
+                    repository_two_identity,
+                    Some(true),
+                    Some(3),
+                    Some(0),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_picker_status_labels_are_explicit_for_all_tracking_states() {
+        assert_eq!(worktree_dirty_label(Some(false)), "clean");
+        assert_eq!(worktree_dirty_label(Some(true)), "dirty");
+        assert_eq!(worktree_dirty_label(None), "unavailable");
+        assert_eq!(worktree_tracking_label(None, None, None), "not applicable");
+        assert_eq!(worktree_tracking_label(Some("feature"), None, None), "unavailable");
+        assert_eq!(worktree_tracking_label(Some("feature"), Some(4), Some(2)), "↑4 ↓2");
+        assert_eq!(worktree_tracking_label(Some("feature"), Some(0), Some(0)), "up to date");
+    }
 }
