@@ -35,7 +35,10 @@ jobs:
         run: cargo build -p git -p git_ui -p project --quiet
 
       - name: Run git crate tests
-        run: cargo test -p git -p git_ui -p project --quiet
+        run: cargo test -p git -p git_ui --quiet
+
+      - name: Run project integration tests
+        run: cargo test -p project --test integration --features test-support --quiet
 
       # Rustfmt does not require a linker.
       - name: Format check
