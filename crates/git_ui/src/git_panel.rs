@@ -14040,7 +14040,7 @@ mod tests {
         let second = selection_test_entry(1, "b.rs");
         let third = selection_test_entry(1, "c.rs");
         let fourth = selection_test_entry(1, "d.rs");
-        let visible = vec![first.clone(), second.clone(), third.clone(), fourth.clone()];
+        let visible = vec![first.clone(), second, third, fourth.clone()];
         let mut selected = Some(first.clone());
         let mut marked = vec![first.clone()];
         let mut anchor = Some(first.clone());
@@ -14067,7 +14067,7 @@ mod tests {
         let third = selection_test_entry(1, "c.rs");
         let visible = vec![first.clone(), second.clone(), third.clone()];
         let mut selected = Some(second.clone());
-        let mut marked = vec![second.clone()];
+        let mut marked = vec![second];
         let mut anchor = Some(first);
 
         update_selection(
@@ -14091,7 +14091,7 @@ mod tests {
         let third = selection_test_entry(1, "c.rs");
         let visible = vec![first, second.clone(), third.clone()];
         let mut selected = Some(second.clone());
-        let mut marked = vec![second.clone()];
+        let mut marked = vec![second];
         let mut anchor = None;
 
         update_selection(
@@ -14122,7 +14122,7 @@ mod tests {
             &mut selected,
             &mut marked,
             &mut anchor,
-            &[replacement.clone()],
+            std::slice::from_ref(&replacement),
         );
 
         assert_eq!(selected, Some(replacement.clone()));
