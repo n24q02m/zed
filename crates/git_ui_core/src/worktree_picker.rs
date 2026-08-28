@@ -2319,15 +2319,14 @@ mod tests {
         let repository_two = project::git_store::RepositoryId(8);
         let repository_one_identity = PathBuf::from("/repos/one/app");
         let repository_two_identity = PathBuf::from("/repos/two/app");
-        let make_worktree = |repository: &str, name: &str, branch: Option<&str>, is_main: bool| {
-            GitWorktree {
+        let make_worktree =
+            |repository: &str, name: &str, branch: Option<&str>, is_main: bool| GitWorktree {
                 path: PathBuf::from(format!("/repos/{repository}/{name}")),
                 ref_name: branch.map(|branch| format!("refs/heads/{branch}").into()),
                 sha: "0123456789abcdef".into(),
                 is_main,
                 is_bare: false,
-            }
-        };
+            };
         let status = |repository_id, repository_identity_path, is_dirty, ahead, behind| {
             WorktreePickerStatus {
                 repository_id,
@@ -2341,35 +2340,83 @@ mod tests {
         let rows = build_worktree_picker_view_model(vec![
             (
                 make_worktree("one", "behind", Some("behind"), false),
-                status(repository_one, repository_one_identity.clone(), Some(false), Some(0), Some(3)),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(3),
+                ),
             ),
             (
                 make_worktree("one", "detached", None, false),
-                status(repository_one, repository_one_identity.clone(), Some(false), None, None),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
             ),
             (
                 make_worktree("one", "dirty", Some("dirty"), false),
-                status(repository_one, repository_one_identity.clone(), Some(true), Some(0), Some(0)),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(true),
+                    Some(0),
+                    Some(0),
+                ),
             ),
             (
                 make_worktree("one", "ahead", Some("ahead"), false),
-                status(repository_one, repository_one_identity.clone(), Some(false), Some(4), Some(0)),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(4),
+                    Some(0),
+                ),
             ),
             (
                 make_worktree("one", "main", Some("main"), true),
-                status(repository_one, repository_one_identity.clone(), Some(false), Some(0), Some(0)),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(0),
+                ),
             ),
             (
                 make_worktree("one", "missing-upstream", Some("local"), false),
-                status(repository_one, repository_one_identity.clone(), Some(false), None, None),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
             ),
             (
                 make_worktree("one", "shared", Some("shared"), false),
-                status(repository_one, repository_one_identity.clone(), Some(false), Some(1), Some(2)),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(1),
+                    Some(2),
+                ),
             ),
             (
                 make_worktree("two", "shared", Some("shared"), false),
-                status(repository_two, repository_two_identity.clone(), Some(true), Some(3), Some(0)),
+                status(
+                    repository_two,
+                    repository_two_identity.clone(),
+                    Some(true),
+                    Some(3),
+                    Some(0),
+                ),
             ),
         ]);
 
@@ -2377,7 +2424,8 @@ mod tests {
             .iter()
             .map(|row| {
                 (
-                    row.worktree.directory_name(Some(&row.status.repository_identity_path)),
+                    row.worktree
+                        .directory_name(Some(&row.status.repository_identity_path)),
                     row.worktree.branch_name().map(str::to_owned),
                     row.worktree.path.clone(),
                     row.status.repository_id,
@@ -2482,8 +2530,17 @@ mod tests {
         assert_eq!(worktree_dirty_label(Some(true)), "dirty");
         assert_eq!(worktree_dirty_label(None), "unavailable");
         assert_eq!(worktree_tracking_label(None, None, None), "not applicable");
-        assert_eq!(worktree_tracking_label(Some("feature"), None, None), "unavailable");
-        assert_eq!(worktree_tracking_label(Some("feature"), Some(4), Some(2)), "↑4 ↓2");
-        assert_eq!(worktree_tracking_label(Some("feature"), Some(0), Some(0)), "up to date");
+        assert_eq!(
+            worktree_tracking_label(Some("feature"), None, None),
+            "unavailable"
+        );
+        assert_eq!(
+            worktree_tracking_label(Some("feature"), Some(4), Some(2)),
+            "↑4 ↓2"
+        );
+        assert_eq!(
+            worktree_tracking_label(Some("feature"), Some(0), Some(0)),
+            "up to date"
+        );
     }
 }
