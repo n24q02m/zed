@@ -516,6 +516,13 @@ impl sum_tree::KeyedItem for StatusEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositoryId(pub u64);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub is_dirty: bool,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MergeDetails {
     pub merge_heads_by_conflicted_path: TreeMap<RepoPath, Vec<Option<SharedString>>>,
@@ -6359,6 +6366,46 @@ impl Repository {
 
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
+    }
+
+    pub fn worktree_status(
+        &self,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WorktreeStatus>> {
+        let repository_state = self.repository_state.clone();
+        cx.spawn(async move |_, _cx| {
+            let state = repository_state.await.map_err(|error| anyhow!(error))?;
+            let RepositoryState::Local(local_state) = state else {
+                bail!("worktree status is unavailable for remote repositories");
+            };
+
+            let system_git_binary_path = local_state
+                .environment
+                .get("PATH")
+                .and_then(|search_paths| {
+                    which::which_in("git", Some(search_paths), &worktree_path).ok()
+                })
+                .or_else(|| which::which("git").ok());
+            let backend = local_state.fs.open_repo(
+                &worktree_path.join(".git"),
+                system_git_binary_path.as_deref(),
+            )?;
+            let status = backend.status(&[]).await?;
+            let branch = backend
+                .branches()
+                .await?
+                .branches
+                .into_iter()
+                .find(|branch| branch.is_head);
+            let tracking = branch.and_then(|branch| branch.tracking_status());
+
+            Ok(WorktreeStatus {
+                is_dirty: !status.entries.is_empty(),
+                ahead: tracking.map(|tracking| tracking.ahead),
+                behind: tracking.map(|tracking| tracking.behind),
+            })
+        })
     }
 
     pub fn pending_ops(&self) -> impl Iterator<Item = PendingOps> + '_ {

@@ -30,4 +30,4 @@ jobs:
         run: cargo fmt --check --package git_ui_core --package project
 
       - name: Run focused worktree picker test
-        run: cargo test -p git_ui_core worktree_picker_view_model_keeps_stable_order_and_all_context --lib
+        run: cargo test -p git_ui_core worktree_picker_ --lib
