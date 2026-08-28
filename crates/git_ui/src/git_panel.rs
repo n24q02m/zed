@@ -597,10 +597,18 @@ enum Section {
     Unstaged,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+enum GitPanelEntryKind {
+    Status,
+    Directory,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 struct GitPanelEntryId {
     repo_id: RepositoryId,
     path: RepoPath,
+    section: Option<Section>,
+    kind: GitPanelEntryKind,
 }
 
 fn reconcile_selection(
@@ -616,15 +624,16 @@ fn reconcile_selection(
         .cloned()
         .collect();
 
-    if selected
+    let selected_was_removed = selected
         .as_ref()
-        .is_some_and(|entry| !visible.contains(entry))
-    {
+        .is_some_and(|entry| !visible.contains(entry));
+    if selected_was_removed {
         *selected = marked.first().cloned();
     }
-    if anchor
-        .as_ref()
-        .is_some_and(|entry| !visible.contains(entry))
+    if selected_was_removed
+        || anchor
+            .as_ref()
+            .is_some_and(|entry| !visible.contains(entry))
     {
         *anchor = selected.clone();
     }
@@ -644,15 +653,26 @@ fn update_selection(
     };
 
     if shift {
-        if let Some(anchor_id) = anchor.as_ref()
-            && let Some(anchor_index) = visible.iter().position(|entry| entry == anchor_id)
-        {
-            let range = if anchor_index <= target_index {
-                anchor_index..=target_index
+        // The current selection is the range anchor.  Prefer it over the
+        // cached anchor so keyboard navigation and auto-selection cannot
+        // leave Shift selection rooted at a stale row.
+        let range_anchor = selected
+            .as_ref()
+            .filter(|entry| visible.contains(entry))
+            .or_else(|| anchor.as_ref().filter(|entry| visible.contains(entry)));
+        if let Some(anchor_id) = range_anchor {
+            if let Some(anchor_index) = visible.iter().position(|entry| entry == anchor_id) {
+                let range = if anchor_index <= target_index {
+                    anchor_index..=target_index
+                } else {
+                    target_index..=anchor_index
+                };
+                *marked = visible[range].to_vec();
+                *anchor = Some(anchor_id.clone());
             } else {
-                target_index..=anchor_index
-            };
-            *marked = visible[range].to_vec();
+                *marked = vec![target.clone()];
+                *anchor = Some(target.clone());
+            }
         } else {
             *marked = vec![target.clone()];
             *anchor = Some(target.clone());
@@ -1508,9 +1528,16 @@ impl GitPanel {
     }
     fn entry_identity(&self, index: usize, repo_id: RepositoryId) -> Option<GitPanelEntryId> {
         let entry = self.entries.get(index)?;
+        let kind = match entry {
+            GitListEntry::Status(_) | GitListEntry::TreeStatus(_) => GitPanelEntryKind::Status,
+            GitListEntry::Directory(_) => GitPanelEntryKind::Directory,
+            GitListEntry::Header(_) | GitListEntry::EmptySection(_) => return None,
+        };
         Some(GitPanelEntryId {
             repo_id,
             path: entry.repo_path()?.clone(),
+            section: self.section_for_entry_index(index),
+            kind,
         })
     }
 
@@ -1519,18 +1546,17 @@ impl GitPanel {
             GitPanelViewMode::Flat => self.visible_flat_entry_indices(),
             GitPanelViewMode::Tree(state) => state.logical_indices.clone(),
         };
-        let mut seen = HashSet::default();
         indices
             .into_iter()
             .filter(|&index| self.entries[index].is_selectable())
             .filter_map(|index| self.entry_identity(index, repo_id))
-            .filter(|entry| seen.insert(entry.clone()))
             .collect()
     }
 
     fn set_selected_entry_index(&mut self, index: usize, repo_id: RepositoryId) {
         self.selected_entry = Some(index);
         self.selected_entry_id = self.entry_identity(index, repo_id);
+        self.selection_anchor = self.selected_entry_id.clone();
     }
 
     fn select_entry_from_pointer(
@@ -1888,6 +1914,7 @@ impl GitPanel {
                 .as_ref()
                 .map(|repo| repo.read(cx).id)
                 .and_then(|repo_id| self.entry_identity(index, repo_id));
+            self.selection_anchor = self.selected_entry_id.clone();
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -1922,6 +1949,7 @@ impl GitPanel {
                 .as_ref()
                 .map(|repo| repo.read(cx).id)
                 .and_then(|repo_id| self.entry_identity(first_entry, repo_id));
+            self.selection_anchor = self.selected_entry_id.clone();
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -2006,6 +2034,7 @@ impl GitPanel {
             .as_ref()
             .map(|repo| repo.read(cx).id)
             .and_then(|repo_id| self.entry_identity(candidate, repo_id));
+        self.selection_anchor = self.selected_entry_id.clone();
         self.scroll_to_selected_entry(cx);
     }
 
@@ -2089,6 +2118,7 @@ impl GitPanel {
             .as_ref()
             .map(|repo| repo.read(cx).id)
             .and_then(|repo_id| self.entry_identity(candidate, repo_id));
+        self.selection_anchor = self.selected_entry_id.clone();
         self.scroll_to_selected_entry(cx);
     }
 
@@ -2111,6 +2141,7 @@ impl GitPanel {
                 .as_ref()
                 .map(|repo| repo.read(cx).id)
                 .and_then(|repo_id| self.entry_identity(last_entry, repo_id));
+            self.selection_anchor = self.selected_entry_id.clone();
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -7815,6 +7846,7 @@ impl GitPanel {
                 .as_ref()
                 .map(|repo| repo.read(cx).id)
                 .and_then(|repo_id| self.entry_identity(ix, repo_id));
+            self.selection_anchor = self.selected_entry_id.clone();
             self.deploy_panel_context_menu(position, Some(ix), true, window, cx);
             return;
         }
@@ -7880,6 +7912,7 @@ impl GitPanel {
             .as_ref()
             .map(|repo| repo.read(cx).id)
             .and_then(|repo_id| self.entry_identity(ix, repo_id));
+        self.selection_anchor = self.selected_entry_id.clone();
         self.set_context_menu(context_menu, position, None, window, cx);
     }
 
@@ -10495,7 +10528,7 @@ mod tests {
         let panel = workspace.update_in(&mut cx, GitPanel::new);
         await_git_panel_entries(&panel, &mut cx).await;
 
-        let entries = panel.read_with(&mut cx, |panel, _| {
+        let entries = panel.read_with(&mut cx, |panel, cx| {
             assert_eq!(panel.entry_count, 6);
             assert_eq!(
                 panel
@@ -10525,6 +10558,19 @@ mod tests {
                     },
                 ]
             );
+            let repo_id = panel
+                .active_repository
+                .as_ref()
+                .expect("active repository should exist")
+                .read(cx)
+                .id;
+            let visible = panel.visible_selectable_entry_ids(repo_id);
+            let partial_ids = visible
+                .iter()
+                .filter(|entry| entry.path == partial_path)
+                .collect::<Vec<_>>();
+            assert_eq!(partial_ids.len(), 2);
+            assert_ne!(partial_ids[0], partial_ids[1]);
             assert_eq!(
                 panel.stage_intent_for_entry_index(projections[0].index),
                 StageIntent::Unstage
@@ -10631,6 +10677,31 @@ mod tests {
                 panel.entry_by_path_in_section(&repo_path("partial.rs"), Section::Staged);
         });
 
+        panel.update_in(&mut cx, |panel, _window, cx| {
+            let repo_id = panel
+                .active_repository
+                .as_ref()
+                .expect("active repository should exist")
+                .read(cx)
+                .id;
+            let staged_index = panel
+                .entry_by_path_in_section(&repo_path("partial.rs"), Section::Staged)
+                .expect("staged projection should exist");
+            let unstaged_index = panel
+                .entry_by_path_in_section(&repo_path("partial.rs"), Section::Unstaged)
+                .expect("unstaged projection should exist");
+            let staged_id = panel
+                .entry_identity(staged_index, repo_id)
+                .expect("staged identity should exist");
+            let unstaged_id = panel
+                .entry_identity(unstaged_index, repo_id)
+                .expect("unstaged identity should exist");
+            assert_ne!(staged_id, unstaged_id);
+            panel.selected_entry = Some(staged_index);
+            panel.selected_entry_id = Some(staged_id.clone());
+            panel.marked_entries = vec![staged_id.clone(), unstaged_id];
+            panel.selection_anchor = Some(staged_id);
+        });
         fs.set_status_for_repo(
             path!("/project/.git").as_ref(),
             &[
@@ -10669,6 +10740,15 @@ mod tests {
                 panel.selected_entry,
                 panel.entry_by_path_in_section(&repo_path("partial.rs"), Section::Unstaged)
             );
+            let selected_id = panel
+                .selected_entry_id
+                .clone()
+                .expect("selected identity should remain after refresh");
+            assert_eq!(selected_id.path, repo_path("partial.rs"));
+            assert_eq!(selected_id.section, Some(Section::Unstaged));
+            assert_eq!(selected_id.kind, GitPanelEntryKind::Status);
+            assert_eq!(panel.marked_entries, vec![selected_id.clone()]);
+            assert_eq!(panel.selection_anchor, Some(selected_id));
         });
     }
 
@@ -13878,20 +13958,49 @@ mod tests {
         );
     }
     fn selection_test_entry(repo_id: u64, path: &str) -> GitPanelEntryId {
+        selection_test_entry_in_section(repo_id, path, None)
+    }
+
+    fn selection_test_entry_in_section(
+        repo_id: u64,
+        path: &str,
+        section: Option<Section>,
+    ) -> GitPanelEntryId {
         GitPanelEntryId {
             repo_id: RepositoryId(repo_id),
             path: repo_path(path),
+            section,
+            kind: GitPanelEntryKind::Status,
         }
     }
 
     #[test]
-    fn test_multi_selection_identity_includes_repository() {
+    fn test_multi_selection_identity_includes_repository_and_projection() {
         let first_repo = selection_test_entry(1, "src/lib.rs");
         let second_repo = selection_test_entry(2, "src/lib.rs");
-        let staged_projection = selection_test_entry(1, "src/lib.rs");
+        let staged_projection =
+            selection_test_entry_in_section(1, "src/lib.rs", Some(Section::Staged));
+        let unstaged_projection =
+            selection_test_entry_in_section(1, "src/lib.rs", Some(Section::Unstaged));
 
         assert_ne!(first_repo, second_repo);
-        assert_eq!(first_repo, staged_projection);
+        assert_ne!(first_repo, staged_projection);
+        assert_ne!(staged_projection, unstaged_projection);
+
+        let visible = vec![staged_projection.clone(), unstaged_projection.clone()];
+        let mut selected = Some(staged_projection.clone());
+        let mut marked = vec![staged_projection.clone()];
+        let mut anchor = Some(staged_projection);
+        update_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &visible,
+            unstaged_projection,
+            true,
+            false,
+        );
+        assert_eq!(marked, visible);
     }
 
     #[test]
@@ -13951,6 +14060,75 @@ mod tests {
         assert_eq!(anchor, Some(first));
     }
 
+    #[test]
+    fn test_multi_selection_shift_click_prefers_current_selection_over_stale_anchor() {
+        let first = selection_test_entry(1, "a.rs");
+        let second = selection_test_entry(1, "b.rs");
+        let third = selection_test_entry(1, "c.rs");
+        let visible = vec![first.clone(), second.clone(), third.clone()];
+        let mut selected = Some(second.clone());
+        let mut marked = vec![second.clone()];
+        let mut anchor = Some(first);
+
+        update_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &visible,
+            third,
+            true,
+            false,
+        );
+
+        assert_eq!(selected, Some(visible[2].clone()));
+        assert_eq!(marked, visible[1..].to_vec());
+        assert_eq!(anchor, Some(visible[1].clone()));
+    }
+    #[test]
+    fn test_multi_selection_shift_click_uses_selected_row_when_anchor_is_missing() {
+        let first = selection_test_entry(1, "a.rs");
+        let second = selection_test_entry(1, "b.rs");
+        let third = selection_test_entry(1, "c.rs");
+        let visible = vec![first, second.clone(), third.clone()];
+        let mut selected = Some(second.clone());
+        let mut marked = vec![second.clone()];
+        let mut anchor = None;
+
+        update_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &visible,
+            third,
+            true,
+            false,
+        );
+
+        assert_eq!(selected, Some(visible[2].clone()));
+        assert_eq!(marked, visible[1..].to_vec());
+        assert_eq!(anchor, Some(visible[1].clone()));
+    }
+
+    #[test]
+    fn test_multi_selection_refresh_reanchors_after_selected_row_removal() {
+        let removed = selection_test_entry(1, "removed.rs");
+        let replacement = selection_test_entry(1, "replacement.rs");
+        let stale_anchor = selection_test_entry(1, "stale-anchor.rs");
+        let mut selected = Some(removed.clone());
+        let mut marked = vec![removed, replacement.clone()];
+        let mut anchor = Some(stale_anchor);
+
+        reconcile_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &[replacement.clone()],
+        );
+
+        assert_eq!(selected, Some(replacement.clone()));
+        assert_eq!(marked, vec![replacement.clone()]);
+        assert_eq!(anchor, Some(replacement));
+    }
     #[test]
     fn test_multi_selection_toggle_click_removes_only_target() {
         let first = selection_test_entry(1, "a.rs");
