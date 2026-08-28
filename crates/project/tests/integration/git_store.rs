@@ -2539,3 +2539,78 @@ mod repository_activation_tests {
         });
     }
 }
+
+mod auto_fetch_reliability_tests {
+    use std::{path::Path, time::Duration};
+
+    use gpui::{BackgroundExecutor, TestAppContext};
+    use project::git_store::{AutoFetchCoordinator, RepositoryEvent, bounded_auto_fetch};
+
+    #[test]
+    fn concurrent_worktrees_share_one_fetch_per_common_directory() {
+        let coordinator = AutoFetchCoordinator::default();
+        let common_dir = Path::new("/repo/.git");
+
+        let first = coordinator.try_acquire(common_dir, true);
+        assert!(
+            first.is_some(),
+            "the first fetch should acquire the directory"
+        );
+        assert!(
+            coordinator.try_acquire(common_dir, true).is_none(),
+            "a concurrent worktree must share the in-flight fetch"
+        );
+
+        drop(first);
+        assert!(
+            coordinator.try_acquire(common_dir, true).is_some(),
+            "a new fetch may start after the previous one finishes"
+        );
+    }
+
+    #[test]
+    fn disabled_auto_fetch_starts_none() {
+        let coordinator = AutoFetchCoordinator::default();
+
+        assert!(
+            coordinator
+                .try_acquire(Path::new("/repo/.git"), false)
+                .is_none(),
+            "disabled auto-fetch must not acquire a fetch"
+        );
+    }
+
+    #[gpui::test]
+    async fn hung_auto_fetch_reaches_deadline(
+        executor: BackgroundExecutor,
+        _cx: &mut TestAppContext,
+    ) {
+        let fetch = executor.spawn(bounded_auto_fetch(
+            executor.clone(),
+            std::future::pending::<anyhow::Result<()>>(),
+            Duration::from_secs(5),
+        ));
+
+        executor.run_until_parked();
+        executor.advance_clock(Duration::from_secs(5));
+        executor.run_until_parked();
+        let error = fetch.await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "automatic git fetch timed out");
+    }
+
+    #[test]
+    fn fetch_failure_is_structured_for_the_git_ui() {
+        let event = project::git_store::auto_fetch_failure_event(
+            Path::new("/repo/.git"),
+            anyhow::anyhow!("remote unavailable"),
+        );
+
+        assert_eq!(
+            event,
+            RepositoryEvent::AutoFetchFailed {
+                common_dir: Path::new("/repo/.git").into(),
+                message: "automatic git fetch failed: remote unavailable".into(),
+            }
+        );
+    }
+}
