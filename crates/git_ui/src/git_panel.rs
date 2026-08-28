@@ -14149,8 +14149,8 @@ mod tests {
             true,
         );
 
-        assert_eq!(selected, Some(second));
+        assert_eq!(selected, Some(second.clone()));
         assert_eq!(marked, vec![first, third]);
-        assert_eq!(anchor, Some(second.clone()));
+        assert_eq!(anchor, Some(second));
     }
 }
