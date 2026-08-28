@@ -32,14 +32,14 @@ jobs:
           cargo --version
 
       - name: Build git crates
-        run: cargo build -p git -p git_ui --quiet
+        run: cargo build -p git -p git_ui -p project --quiet
 
       - name: Run git crate tests
-        run: cargo test -p git -p git_ui --quiet
+        run: cargo test -p git -p git_ui -p project --quiet
 
       # Rustfmt does not require a linker.
       - name: Format check
-        run: cargo fmt --check -p git -p git_ui
+        run: cargo fmt --check -p git -p git_ui -p project
 
   clippy-linux:
     runs-on: ubuntu-latest
