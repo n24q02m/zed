@@ -13,7 +13,7 @@ use gpui::{
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::{
     Project,
-    git_store::{RepositoryEvent, RepositoryId, WorktreeStatus},
+    git_store::{RepositoryEvent, RepositoryId},
     repo_identity_path_if_local,
 };
 use ui::{
