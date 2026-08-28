@@ -173,7 +173,7 @@ impl WorktreePicker {
                     },
                     None => Vec::new(),
                 };
-                let mut loaded_statuses = HashMap::new();
+                let mut loaded_statuses = HashMap::default();
                 if let Some(repository) = status_repository {
                     for worktree in &all_worktrees {
                         let path = worktree.path.clone();
@@ -183,19 +183,13 @@ impl WorktreePicker {
                             })
                             .await
                         {
-                            Ok(Ok(status)) => {
+                            Ok(status) => {
                                 loaded_statuses.insert(path, status);
                             }
-                            Ok(Err(error)) => {
+                            Err(error) => {
                                 log::debug!(
                                     "WorktreePicker: status load failed for {path:?}: {error}"
                                 );
-                            }
-                            Err(_) => {
-                                log::debug!(
-                                    "WorktreePicker: status request was cancelled for {path:?}"
-                                );
-                                return anyhow::Ok(());
                             }
                         }
                     }
@@ -242,7 +236,7 @@ impl WorktreePicker {
                                 .into_iter()
                                 .filter(|wt| !wt.is_bare)
                                 .collect();
-                            let mut loaded_statuses = HashMap::new();
+                            let mut loaded_statuses = HashMap::default();
                             for worktree in &all_worktrees {
                                 let path = worktree.path.clone();
                                 match status_repository
@@ -251,15 +245,14 @@ impl WorktreePicker {
                                     })
                                     .await
                                 {
-                                    Ok(Ok(status)) => {
+                                    Ok(status) => {
                                         loaded_statuses.insert(path, status);
                                     }
-                                    Ok(Err(error)) => {
+                                    Err(error) => {
                                         log::debug!(
                                             "WorktreePicker: status load failed for {path:?}: {error}"
                                         );
                                     }
-                                    Err(_) => return anyhow::Ok(()),
                                 }
                             }
                             picker.update_in(cx, |picker, window, cx| {
@@ -634,7 +627,7 @@ impl WorktreePickerDelegate {
             let repository = repository.read(cx);
             worktree_matches_repository(
                 worktree.path.as_path(),
-                repository.work_directory_abs_path.as_deref(),
+                Some(repository.work_directory_abs_path.as_ref()),
                 repo_identity_path_if_local(&repository.common_dir_abs_path, repository.path_style),
                 self.repository_identity_path.as_deref(),
             )
