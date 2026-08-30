@@ -6784,7 +6784,7 @@ mod tests {
 mod stash_selected_tests {
     use std::{ffi::OsStr, fs, path::Path, sync::Arc};
 
-    use collections::HashMap;
+    use collections::FxHashMap;
 
     use super::{GitRepository, RealGitRepository};
     use gpui::TestAppContext;
@@ -6859,7 +6859,7 @@ mod stash_selected_tests {
         )
         .unwrap();
 
-        repo.stash_paths(Vec::new(), None, Arc::new(HashMap::new()))
+        repo.stash_paths(Vec::new(), None, Arc::new(FxHashMap::default()))
             .await
             .unwrap();
 
@@ -6885,8 +6885,8 @@ mod stash_selected_tests {
         .unwrap()
     }
 
-    fn empty_environment() -> Arc<HashMap<String, String>> {
-        Arc::new(HashMap::new())
+    fn empty_environment() -> Arc<FxHashMap<String, String>> {
+        Arc::new(FxHashMap::default())
     }
 
     fn commit_files(temp_dir: &Path, files: &[(&str, &str)]) {
