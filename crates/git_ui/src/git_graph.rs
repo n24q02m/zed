@@ -11,7 +11,10 @@ use file_icons::FileIcons;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
-    repository::{InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs},
+    repository::{
+        Branch, InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs,
+        UpstreamTrackingStatus,
+    },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
@@ -1288,6 +1291,55 @@ fn compute_diff_stats(diff: &CommitDiff) -> (usize, usize) {
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GraphJumpTargets {
+    head: Option<Oid>,
+    upstream: Option<Oid>,
+    upstream_status: Option<UpstreamTrackingStatus>,
+    merge_target: Option<Oid>,
+}
+
+fn graph_jump_oid(sha: &SharedString) -> Option<Oid> {
+    Oid::try_from(sha.as_ref()).ok()
+}
+
+/// Resolves graph jump destinations from the repository data already owned by GitStore.
+///
+/// Upstream commits are resolved through the scanned branch list so a deleted or unavailable
+/// upstream never produces a stale destination. Merge targets come from the repository's
+/// existing merge-head state instead of introducing another Git model.
+fn graph_jump_targets<'a>(
+    head_sha: Option<&'a SharedString>,
+    branch: Option<&'a Branch>,
+    branches: &'a [Branch],
+    merge_heads: impl Iterator<Item = Option<&'a SharedString>>,
+) -> GraphJumpTargets {
+    let head = head_sha.and_then(graph_jump_oid);
+
+    let upstream = branch
+        .and_then(|branch| branch.upstream.as_ref())
+        .filter(|upstream| !upstream.tracking.is_gone())
+        .and_then(|upstream| {
+            let oid = branches
+                .iter()
+                .find(|branch| branch.ref_name == upstream.ref_name)
+                .and_then(|branch| branch.most_recent_commit.as_ref())
+                .and_then(|commit| graph_jump_oid(&commit.sha));
+            oid.map(|oid| (oid, upstream.tracking.status()))
+        });
+    let (upstream, upstream_status) =
+        upstream.map_or((None, None), |(oid, status)| (Some(oid), status));
+
+    let merge_target = merge_heads.find_map(|sha| sha.and_then(graph_jump_oid));
+
+    GraphJumpTargets {
+        head,
+        upstream,
+        upstream_status,
+        merge_target,
+    }
+}
+
 struct GitGraphContextMenu {
     menu: Entity<ContextMenu>,
     position: Point<Pixels>,
@@ -2537,8 +2589,62 @@ impl GitGraph {
         self.set_context_menu(context_menu, position, None, window, cx);
     }
 
+    fn graph_jump_targets(&self, cx: &App) -> GraphJumpTargets {
+        if matches!(self.log_source, LogSource::Path(_)) {
+            return GraphJumpTargets::default();
+        }
+        let Some(repository) = self.get_repository(cx) else {
+            return GraphJumpTargets::default();
+        };
+
+        let snapshot = repository.read(cx).snapshot();
+        let merge_heads = snapshot
+            .merge
+            .merge_heads_by_conflicted_path
+            .values()
+            .flat_map(|heads| heads.iter().map(Option::as_ref));
+        graph_jump_targets(
+            snapshot.head_commit.as_ref().map(|commit| &commit.sha),
+            snapshot.branch.as_ref(),
+            &snapshot.branch_list,
+            merge_heads,
+        )
+    }
+
+    fn render_graph_jump_button(
+        &self,
+        id: &'static str,
+        icon: IconName,
+        tooltip: String,
+        target: Option<Oid>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let button = IconButton::new(id, icon)
+            .shape(ui::IconButtonShape::Square)
+            .icon_size(IconSize::Small)
+            .tooltip(Tooltip::text(tooltip));
+        match target {
+            Some(oid) => button
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.select_commit_by_sha(oid, cx);
+                }))
+                .into_any_element(),
+            None => button.disabled(true).into_any_element(),
+        }
+    }
+
     fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let color = cx.theme().colors();
+        let jump_targets = self.graph_jump_targets(cx);
+        let upstream_tooltip = jump_targets
+            .upstream_status
+            .map(|status| {
+                format!(
+                    "Jump to Upstream ({} ahead, {} behind)",
+                    status.ahead, status.behind,
+                )
+            })
+            .unwrap_or_else(|| "Jump to Upstream".to_string());
         let query_focus_handle = self
             .search_state
             .editor
@@ -2593,6 +2699,31 @@ impl GitGraph {
                                 )
                             })
                     }),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(self.render_graph_jump_button(
+                        "git-graph-jump-head",
+                        IconName::GitCommit,
+                        "Jump to HEAD".to_string(),
+                        jump_targets.head,
+                        cx,
+                    ))
+                    .child(self.render_graph_jump_button(
+                        "git-graph-jump-upstream",
+                        IconName::GitBranch,
+                        upstream_tooltip,
+                        jump_targets.upstream,
+                        cx,
+                    ))
+                    .child(self.render_graph_jump_button(
+                        "git-graph-jump-merge-target",
+                        IconName::GitMergeConflict,
+                        "Jump to Merge Target".to_string(),
+                        jump_targets.merge_target,
+                        cx,
+                    )),
             )
             .child(
                 h_flex()
@@ -4761,9 +4892,7 @@ mod tests {
 
     #[test]
     fn graph_jump_targets_missing_upstream_are_unavailable() {
-        let head_sha = SharedString::from(
-            "1111111111111111111111111111111111111111",
-        );
+        let head_sha = SharedString::from("1111111111111111111111111111111111111111");
         let branch = git::repository::Branch {
             is_head: true,
             ref_name: "refs/heads/feature".into(),
@@ -4788,16 +4917,9 @@ mod tests {
 
     #[test]
     fn graph_jump_targets_detached_head_still_exposes_head() {
-        let head_sha = SharedString::from(
-            "2222222222222222222222222222222222222222",
-        );
+        let head_sha = SharedString::from("2222222222222222222222222222222222222222");
 
-        let targets = graph_jump_targets(
-            Some(&head_sha),
-            None,
-            &[],
-            std::iter::empty(),
-        );
+        let targets = graph_jump_targets(Some(&head_sha), None, &[], std::iter::empty());
 
         assert_eq!(targets.head, Some(test_oid(head_sha.as_ref())));
         assert_eq!(targets.upstream, None);
@@ -4806,19 +4928,18 @@ mod tests {
 
     #[test]
     fn graph_jump_targets_preserve_ahead_behind_upstream() {
-        let head_sha = SharedString::from(
-            "3333333333333333333333333333333333333333",
-        );
-        let upstream_sha = SharedString::from(
-            "4444444444444444444444444444444444444444",
-        );
+        let head_sha = SharedString::from("3333333333333333333333333333333333333333");
+        let upstream_sha = SharedString::from("4444444444444444444444444444444444444444");
         let branch = git::repository::Branch {
             is_head: true,
             ref_name: "refs/heads/feature".into(),
             upstream: Some(git::repository::Upstream {
                 ref_name: "refs/remotes/origin/feature".into(),
                 tracking: git::repository::UpstreamTracking::Tracked(
-                    git::repository::UpstreamTrackingStatus { ahead: 2, behind: 3 },
+                    git::repository::UpstreamTrackingStatus {
+                        ahead: 2,
+                        behind: 3,
+                    },
                 ),
             }),
             most_recent_commit: Some(test_commit_summary(head_sha.as_ref())),
@@ -4840,15 +4961,16 @@ mod tests {
         assert_eq!(targets.upstream, Some(test_oid(upstream_sha.as_ref())));
         assert_eq!(
             targets.upstream_status,
-            Some(git::repository::UpstreamTrackingStatus { ahead: 2, behind: 3 })
+            Some(git::repository::UpstreamTrackingStatus {
+                ahead: 2,
+                behind: 3
+            })
         );
     }
 
     #[test]
     fn graph_jump_targets_missing_merge_target_are_unavailable() {
-        let head_sha = SharedString::from(
-            "5555555555555555555555555555555555555555",
-        );
+        let head_sha = SharedString::from("5555555555555555555555555555555555555555");
         let merge_heads: [Option<SharedString>; 0] = [];
 
         let targets = graph_jump_targets(
