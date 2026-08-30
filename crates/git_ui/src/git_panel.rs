@@ -1337,6 +1337,17 @@ impl GitPanel {
                             })
                             .ok();
                     }
+                    GitStoreEvent::RepositoryUpdated(
+                        _,
+                        RepositoryEvent::AutoFetchFailed { message, .. },
+                        _,
+                    ) => {
+                        this.show_error_toast(
+                            "automatic git fetch",
+                            anyhow::anyhow!(message.to_string()),
+                            cx,
+                        );
+                    }
                     GitStoreEvent::RepositoryUpdated(_, _, _) => {}
                     GitStoreEvent::JobsUpdated
                     | GitStoreEvent::ConflictsUpdated

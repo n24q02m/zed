@@ -2910,6 +2910,14 @@ impl GitRepository for RealGitRepository {
                 executor.clone(),
                 is_trusted,
             );
+            let git = if env
+                .get("GIT_TERMINAL_PROMPT")
+                .is_some_and(|value| value == "0")
+            {
+                git.non_interactive()
+            } else {
+                git
+            };
             let mut command = git.build_command(&["fetch", &remote_name]);
             command
                 .envs(env.iter())
@@ -3868,6 +3876,8 @@ pub(crate) struct GitBinary {
     index_file_path: Option<PathBuf>,
     envs: HashMap<String, String>,
     is_trusted: bool,
+    /// Whether this command may prompt for user input.
+    interactive: bool,
 }
 
 impl GitBinary {
@@ -3886,11 +3896,18 @@ impl GitBinary {
             index_file_path: None,
             envs: HashMap::default(),
             is_trusted,
+            interactive: true,
         }
     }
 
     fn envs(mut self, envs: HashMap<String, String>) -> Self {
         self.envs = envs;
+        self
+    }
+
+    /// Disable prompts and maintenance work for unattended commands.
+    pub(crate) fn non_interactive(mut self) -> Self {
+        self.interactive = false;
         self
     }
 
@@ -3984,6 +4001,10 @@ impl GitBinary {
             command.args(["-c", "protocol.ext.allow=never"]);
             command.args(["-c", "diff.external="]);
         }
+        if !self.interactive {
+            command.args(["-c", "credential.interactive=false"]);
+            command.args(["-c", "gc.auto=0"]);
+        }
         command.args(args);
 
         // If the `diff` command is being used, we'll want to add the
@@ -4015,6 +4036,13 @@ async fn run_git_command(
     mut command: util::command::Command,
     executor: BackgroundExecutor,
 ) -> Result<RemoteCommandOutput> {
+    if env
+        .get("GIT_TERMINAL_PROMPT")
+        .is_some_and(|value| value == "0")
+    {
+        command.env("GIT_TERMINAL_PROMPT", "0");
+        command.kill_on_drop(true);
+    }
     if env.contains_key("GIT_ASKPASS") {
         let git_process = command.spawn()?;
         let output = git_process.output().await?;

@@ -103,6 +103,8 @@ pub struct GitStore {
     repositories: HashMap<RepositoryId, Entity<Repository>>,
     parked_repositories: Vec<ParkedRepository>,
     diff_base: GitDiffBaseSetting,
+    auto_fetch_coordinator: AutoFetchCoordinator,
+    auto_fetch_config: AutoFetchConfig,
     display_diffs: HashMap<RepositoryId, DisplayDiff>,
     worktree_ids: HashMap<RepositoryId, HashSet<WorktreeId>>,
     active_repo_id: Option<RepositoryId>,
@@ -516,6 +518,100 @@ impl sum_tree::KeyedItem for StatusEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositoryId(pub u64);
 
+/// Configuration for repository background fetches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoFetchConfig {
+    pub enabled: bool,
+    pub interval: Duration,
+    pub deadline: Duration,
+}
+
+impl Default for AutoFetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: Duration::from_secs(60),
+            deadline: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Coordinates unattended fetches across all worktrees of a repository.
+///
+/// Git worktrees share the repository's common directory and therefore its
+/// remote-tracking ref locks. Keying this guard by that directory prevents two
+/// worktree entities from starting competing automatic fetches.
+#[derive(Clone, Default)]
+pub struct AutoFetchCoordinator {
+    in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+/// A lease held for the duration of one automatic fetch.
+pub struct AutoFetchPermit {
+    common_dir: PathBuf,
+    in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+impl Drop for AutoFetchPermit {
+    fn drop(&mut self) {
+        self.in_flight.lock().remove(&self.common_dir);
+    }
+}
+
+impl AutoFetchCoordinator {
+    /// Try to reserve a common directory for an automatic fetch.
+    ///
+    /// Disabled auto-fetch is a no-op and never reserves a directory. A second
+    /// worktree sharing the same common directory observes the existing lease
+    /// and skips its tick instead of queuing another fetch.
+    pub fn try_acquire(&self, common_dir: &Path, enabled: bool) -> Option<AutoFetchPermit> {
+        if !enabled {
+            return None;
+        }
+
+        let common_dir = common_dir.to_path_buf();
+        let mut in_flight = self.in_flight.lock();
+        if !in_flight.insert(common_dir.clone()) {
+            return None;
+        }
+
+        Some(AutoFetchPermit {
+            common_dir,
+            in_flight: self.in_flight.clone(),
+        })
+    }
+}
+
+/// Bound an unattended operation with the executor's deterministic timer.
+///
+/// The timer is supplied by the caller's executor so tests can advance it
+/// without sleeping. Dropping the operation future is intentional: the
+/// repository command marks unattended child processes kill-on-drop.
+pub async fn bounded_auto_fetch<T, F>(
+    executor: BackgroundExecutor,
+    operation: F,
+    deadline: Duration,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let timer = executor.timer(deadline);
+    futures::pin_mut!(timer, operation);
+    futures::select_biased! {
+        result = operation.fuse() => result,
+        _ = timer.fuse() => Err(anyhow!("automatic git fetch timed out")),
+    }
+}
+
+/// Convert an automatic fetch failure into the structured repository event
+/// consumed by the Git UI notification path.
+pub fn auto_fetch_failure_event(common_dir: &Path, error: anyhow::Error) -> RepositoryEvent {
+    RepositoryEvent::AutoFetchFailed {
+        common_dir: common_dir.into(),
+        message: format!("automatic git fetch failed: {error:#}").into(),
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MergeDetails {
     pub merge_heads_by_conflicted_path: TreeMap<RepoPath, Vec<Option<SharedString>>>,
@@ -633,6 +729,9 @@ pub struct Repository {
     initial_graph_data: HashMap<(LogSource, LogOrder), InitialGitGraphData>,
     commit_data_handler: CommitDataHandlerState,
     commit_data: HashMap<Oid, CommitDataState>,
+    auto_fetch_coordinator: AutoFetchCoordinator,
+    auto_fetch_task: Option<Task<()>>,
+    auto_fetch_config: AutoFetchConfig,
 }
 
 type RemoteAskPassDelegates = Arc<Mutex<HashMap<u64, RemoteAskPassDelegate>>>;
@@ -772,8 +871,14 @@ pub enum RepositoryEvent {
     BranchListChanged,
     StashEntriesChanged,
     GitWorktreeListChanged,
-    PendingOpsChanged { pending_ops: SumTree<PendingOps> },
+    PendingOpsChanged {
+        pending_ops: SumTree<PendingOps>,
+    },
     GraphEvent((LogSource, LogOrder), GitGraphEvent),
+    AutoFetchFailed {
+        common_dir: Arc<Path>,
+        message: SharedString,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -916,6 +1021,21 @@ impl GitStore {
         )
     }
 
+    /// Configure automatic fetching for every local repository currently owned by
+    /// this store. Newly discovered repositories inherit the same configuration.
+    pub fn configure_auto_fetch(&mut self, config: AutoFetchConfig, cx: &mut Context<Self>) {
+        self.auto_fetch_config = config;
+        for repository in self.repositories.values() {
+            repository.update(cx, |repository, cx| {
+                repository.configure_auto_fetch(config, cx);
+            });
+        }
+    }
+
+    pub fn auto_fetch_config(&self) -> AutoFetchConfig {
+        self.auto_fetch_config
+    }
+
     fn new(
         worktree_store: Entity<WorktreeStore>,
         buffer_store: Entity<BufferStore>,
@@ -941,6 +1061,8 @@ impl GitStore {
 
         let diff_base_setting = ProjectSettings::get_global(cx).git.diff_base;
         GitStore {
+            auto_fetch_coordinator: Default::default(),
+            auto_fetch_config: Default::default(),
             state,
             buffer_store,
             worktree_store,
@@ -2827,6 +2949,8 @@ impl GitStore {
 
         let id = RepositoryId(next_repository_id.fetch_add(1, atomic::Ordering::Release));
         let git_store = cx.weak_entity();
+        let auto_fetch_coordinator = self.auto_fetch_coordinator.clone();
+        let auto_fetch_config = self.auto_fetch_config;
         let repo = cx.new(|cx| {
             let mut repo = Repository::local(
                 id,
@@ -2838,8 +2962,10 @@ impl GitStore {
                 fs,
                 is_trusted,
                 git_store,
+                auto_fetch_coordinator,
                 cx,
             );
+            repo.configure_auto_fetch(auto_fetch_config, cx);
             if let Some(updates_tx) = updates_tx.as_ref() {
                 // trigger an empty `UpdateRepository` to ensure remote active_repo_id is set correctly
                 updates_tx
@@ -6356,6 +6482,77 @@ impl Repository {
             _ => false,
         }
     }
+    /// Start or stop the bounded automatic fetch timer for this repository.
+    pub fn configure_auto_fetch(&mut self, config: AutoFetchConfig, cx: &mut Context<Self>) {
+        if self.auto_fetch_config == config {
+            return;
+        }
+
+        self.auto_fetch_config = config;
+        self.auto_fetch_task = None;
+        if !config.enabled {
+            return;
+        }
+
+        let this = cx.weak_entity();
+        let common_dir = self.snapshot.common_dir_abs_path.clone();
+        let coordinator = self.auto_fetch_coordinator.clone();
+        self.auto_fetch_task = Some(cx.spawn(async move |_, cx| {
+            loop {
+                cx.background_executor().timer(config.interval).await;
+                let fetch = this.update(cx, |repository, cx| {
+                    let permit = coordinator.try_acquire(&common_dir, true)?;
+                    Some(repository.start_auto_fetch_once(permit, config.deadline, cx))
+                });
+                let Ok(Some(fetch)) = fetch else {
+                    break;
+                };
+
+                if let Err(error) = fetch.await {
+                    let _ = this.update(cx, |_, cx| {
+                        cx.emit(auto_fetch_failure_event(&common_dir, error));
+                    });
+                }
+            }
+        }));
+    }
+
+    fn start_auto_fetch_once(
+        &mut self,
+        permit: AutoFetchPermit,
+        deadline: Duration,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<RemoteCommandOutput>> {
+        let repository_state = self.repository_state.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |_, mut cx| {
+            let _permit = permit;
+            let state = repository_state.await.map_err(|error| anyhow!(error))?;
+            let RepositoryState::Local(LocalRepositoryState {
+                backend,
+                environment,
+                ..
+            }) = state
+            else {
+                bail!("automatic git fetch is only supported for local repositories");
+            };
+
+            let mut environment = (*environment).clone();
+            environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+            let askpass = AskPassDelegate::new(&mut cx, |_, response, _| drop(response));
+            bounded_auto_fetch(
+                executor,
+                backend.fetch(
+                    FetchOptions::All,
+                    askpass,
+                    Arc::new(environment),
+                    cx.clone(),
+                ),
+                deadline,
+            )
+            .await
+        })
+    }
 
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
@@ -6445,6 +6642,7 @@ impl Repository {
         fs: Arc<dyn Fs>,
         is_trusted: bool,
         git_store: WeakEntity<GitStore>,
+        auto_fetch_coordinator: AutoFetchCoordinator,
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot = RepositorySnapshot::empty(
@@ -6475,6 +6673,9 @@ impl Repository {
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
+            auto_fetch_coordinator,
+            auto_fetch_task: None,
+            auto_fetch_config: AutoFetchConfig::default(),
         };
         repo.respawn_local_worker(project_environment, fs, is_trusted, cx);
         cx.subscribe_self(Self::handle_subscribe_self).detach();
@@ -6525,6 +6726,9 @@ impl Repository {
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
+            auto_fetch_coordinator: AutoFetchCoordinator::default(),
+            auto_fetch_task: None,
+            auto_fetch_config: AutoFetchConfig::default(),
         }
     }
 
