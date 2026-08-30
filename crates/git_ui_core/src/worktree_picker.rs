@@ -2125,7 +2125,7 @@ mod tests {
         cx: &mut VisualTestContext,
     ) -> bool {
         let worktrees = repository
-            .update(cx, |repository, _| repository.worktrees())
+            .update(cx, |repository, cx| repository.worktrees_unqueued(cx))
             .await
             .unwrap()
             .unwrap();
