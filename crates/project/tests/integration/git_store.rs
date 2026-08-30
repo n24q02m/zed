@@ -2594,7 +2594,7 @@ mod auto_fetch_reliability_tests {
         executor.run_until_parked();
         executor.advance_clock(Duration::from_secs(5));
         executor.run_until_parked();
-        let error = fetch.await.unwrap().unwrap_err();
+        let error = fetch.await.unwrap_err();
         assert_eq!(error.to_string(), "automatic git fetch timed out");
     }
 
