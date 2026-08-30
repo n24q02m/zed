@@ -6782,7 +6782,9 @@ mod tests {
 
 #[cfg(test)]
 mod stash_selected_tests {
-    use std::{collections::HashMap, ffi::OsStr, fs, path::Path, sync::Arc};
+    use std::{ffi::OsStr, fs, path::Path, sync::Arc};
+
+    use collections::HashMap;
 
     use super::{GitRepository, RealGitRepository};
     use gpui::TestAppContext;
@@ -6905,7 +6907,7 @@ mod stash_selected_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         git_command(temp_dir.path(), ["init", "-b", "main"]);
         commit_files(
-            &temp_dir,
+            temp_dir.path(),
             &[("selected.txt", "before"), ("unrelated.txt", "before")],
         );
         fs::write(temp_dir.path().join("selected.txt"), "selected after").unwrap();
@@ -6935,7 +6937,7 @@ mod stash_selected_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         git_command(temp_dir.path(), ["init", "-b", "main"]);
         commit_files(
-            &temp_dir,
+            temp_dir.path(),
             &[("selected.txt", "before"), ("unrelated.txt", "before")],
         );
         fs::write(temp_dir.path().join("selected.txt"), "selected staged").unwrap();
@@ -6967,7 +6969,7 @@ mod stash_selected_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         git_command(temp_dir.path(), ["init", "-b", "main"]);
         commit_files(
-            &temp_dir,
+            temp_dir.path(),
             &[("deleted.txt", "before"), ("unrelated.txt", "before")],
         );
         fs::remove_file(temp_dir.path().join("deleted.txt")).unwrap();
@@ -6991,7 +6993,7 @@ mod stash_selected_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         git_command(temp_dir.path(), ["init", "-b", "main"]);
         commit_files(
-            &temp_dir,
+            temp_dir.path(),
             &[("renamed/old.txt", "before"), ("unrelated.txt", "before")],
         );
         git_command(
