@@ -4745,6 +4745,123 @@ mod tests {
             .collect()
     }
 
+    fn test_oid(value: &str) -> Oid {
+        value.try_into().unwrap()
+    }
+
+    fn test_commit_summary(sha: &str) -> git::repository::CommitSummary {
+        git::repository::CommitSummary {
+            sha: sha.into(),
+            subject: "test commit".into(),
+            commit_timestamp: 0,
+            author_name: "test".into(),
+            has_parent: true,
+        }
+    }
+
+    #[test]
+    fn graph_jump_targets_missing_upstream_are_unavailable() {
+        let head_sha = SharedString::from(
+            "1111111111111111111111111111111111111111",
+        );
+        let branch = git::repository::Branch {
+            is_head: true,
+            ref_name: "refs/heads/feature".into(),
+            upstream: Some(git::repository::Upstream {
+                ref_name: "refs/remotes/origin/feature".into(),
+                tracking: git::repository::UpstreamTracking::Gone,
+            }),
+            most_recent_commit: Some(test_commit_summary(head_sha.as_ref())),
+        };
+
+        let targets = graph_jump_targets(
+            Some(&head_sha),
+            Some(&branch),
+            std::slice::from_ref(&branch),
+            std::iter::empty(),
+        );
+
+        assert_eq!(targets.head, Some(test_oid(head_sha.as_ref())));
+        assert_eq!(targets.upstream, None);
+        assert_eq!(targets.upstream_status, None);
+    }
+
+    #[test]
+    fn graph_jump_targets_detached_head_still_exposes_head() {
+        let head_sha = SharedString::from(
+            "2222222222222222222222222222222222222222",
+        );
+
+        let targets = graph_jump_targets(
+            Some(&head_sha),
+            None,
+            &[],
+            std::iter::empty(),
+        );
+
+        assert_eq!(targets.head, Some(test_oid(head_sha.as_ref())));
+        assert_eq!(targets.upstream, None);
+        assert_eq!(targets.merge_target, None);
+    }
+
+    #[test]
+    fn graph_jump_targets_preserve_ahead_behind_upstream() {
+        let head_sha = SharedString::from(
+            "3333333333333333333333333333333333333333",
+        );
+        let upstream_sha = SharedString::from(
+            "4444444444444444444444444444444444444444",
+        );
+        let branch = git::repository::Branch {
+            is_head: true,
+            ref_name: "refs/heads/feature".into(),
+            upstream: Some(git::repository::Upstream {
+                ref_name: "refs/remotes/origin/feature".into(),
+                tracking: git::repository::UpstreamTracking::Tracked(
+                    git::repository::UpstreamTrackingStatus { ahead: 2, behind: 3 },
+                ),
+            }),
+            most_recent_commit: Some(test_commit_summary(head_sha.as_ref())),
+        };
+        let upstream_branch = git::repository::Branch {
+            is_head: false,
+            ref_name: "refs/remotes/origin/feature".into(),
+            upstream: None,
+            most_recent_commit: Some(test_commit_summary(upstream_sha.as_ref())),
+        };
+
+        let targets = graph_jump_targets(
+            Some(&head_sha),
+            Some(&branch),
+            &[branch, upstream_branch],
+            std::iter::empty(),
+        );
+
+        assert_eq!(targets.upstream, Some(test_oid(upstream_sha.as_ref())));
+        assert_eq!(
+            targets.upstream_status,
+            Some(git::repository::UpstreamTrackingStatus { ahead: 2, behind: 3 })
+        );
+    }
+
+    #[test]
+    fn graph_jump_targets_missing_merge_target_are_unavailable() {
+        let head_sha = SharedString::from(
+            "5555555555555555555555555555555555555555",
+        );
+        let merge_heads: [Option<SharedString>; 0] = [];
+
+        let targets = graph_jump_targets(
+            Some(&head_sha),
+            None,
+            &[],
+            merge_heads.iter().map(Option::as_ref),
+        );
+
+        assert_eq!(targets.head, Some(test_oid(head_sha.as_ref())));
+        assert_eq!(targets.merge_target, None);
+    }
+
     fn verify_commit_order(
         graph: &GraphData,
         commits: &[Arc<InitialGraphCommitData>],
