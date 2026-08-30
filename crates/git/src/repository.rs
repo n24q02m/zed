@@ -6789,6 +6789,7 @@ mod stash_selected_tests {
     use super::{GitRepository, RealGitRepository};
     use gpui::TestAppContext;
 
+    #[allow(clippy::disallowed_methods)]
     fn git_command<I, S>(working_directory: &Path, arguments: I)
     where
         I: IntoIterator<Item = S>,
@@ -6812,6 +6813,7 @@ mod stash_selected_tests {
         );
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn status(working_directory: &Path) -> String {
         let output = std::process::Command::new("git")
             .args(["status", "--porcelain"])
@@ -6822,6 +6824,7 @@ mod stash_selected_tests {
         String::from_utf8(output.stdout).unwrap()
     }
 
+    #[allow(clippy::disallowed_methods)]
     fn git_output<I, S>(working_directory: &Path, arguments: I) -> String
     where
         I: IntoIterator<Item = S>,
@@ -6864,15 +6867,7 @@ mod stash_selected_tests {
             .unwrap();
 
         assert_eq!(status(temp_dir.path()), " M selected.txt\n");
-        assert!(
-            std::process::Command::new("git")
-                .args(["stash", "list"])
-                .current_dir(temp_dir.path())
-                .output()
-                .unwrap()
-                .stdout
-                .is_empty()
-        );
+        assert!(git_output(temp_dir.path(), ["stash", "list"]).is_empty());
     }
 
     fn repository(temp_dir: &tempfile::TempDir, cx: &TestAppContext) -> RealGitRepository {
