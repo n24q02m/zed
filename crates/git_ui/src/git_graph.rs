@@ -4954,7 +4954,7 @@ mod tests {
         let targets = graph_jump_targets(
             Some(&head_sha),
             Some(&branch),
-            &[branch, upstream_branch],
+            &[branch.clone(), upstream_branch],
             std::iter::empty(),
         );
 
