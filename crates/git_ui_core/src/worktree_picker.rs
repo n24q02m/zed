@@ -172,7 +172,7 @@ impl WorktreePicker {
                     },
                     None => Vec::new(),
                 };
-                let mut loaded_statuses = HashMap::new();
+                let mut loaded_statuses = HashMap::default();
                 if let Some(repository) = status_repository {
                     for worktree in &all_worktrees {
                         let path = worktree.path.clone();
@@ -182,19 +182,13 @@ impl WorktreePicker {
                             })
                             .await
                         {
-                            Ok(Ok(status)) => {
+                            Ok(status) => {
                                 loaded_statuses.insert(path, status);
                             }
-                            Ok(Err(error)) => {
+                            Err(error) => {
                                 log::debug!(
                                     "WorktreePicker: status load failed for {path:?}: {error}"
                                 );
-                            }
-                            Err(_) => {
-                                log::debug!(
-                                    "WorktreePicker: status request was cancelled for {path:?}"
-                                );
-                                return anyhow::Ok(());
                             }
                         }
                     }
