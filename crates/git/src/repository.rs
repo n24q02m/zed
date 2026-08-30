@@ -6776,3 +6776,77 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod stash_selected_tests {
+    use std::{collections::HashMap, ffi::OsStr, fs, path::Path, sync::Arc};
+
+    use super::{GitRepository, RealGitRepository};
+    use gpui::TestAppContext;
+
+    fn git_command<I, S>(working_directory: &Path, arguments: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(working_directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+            .output()
+            .expect("failed to run git command");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn status(working_directory: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(working_directory)
+            .output()
+            .expect("failed to read git status");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[gpui::test]
+    async fn empty_selected_paths_do_not_stash_everything(cx: &mut TestAppContext) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        git_command(temp_dir.path(), ["init", "-b", "main"]);
+        fs::write(temp_dir.path().join("selected.txt"), "before").unwrap();
+        git_command(temp_dir.path(), ["add", "selected.txt"]);
+        git_command(temp_dir.path(), ["commit", "-m", "initial"]);
+        fs::write(temp_dir.path().join("selected.txt"), "after").unwrap();
+
+        let repo = RealGitRepository::new(
+            &temp_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        repo.stash_paths(Vec::new(), None, Arc::new(HashMap::new()))
+            .await
+            .unwrap();
+
+        assert_eq!(status(temp_dir.path()), " M selected.txt\n");
+        assert!(
+            std::process::Command::new("git")
+                .args(["stash", "list"])
+                .current_dir(temp_dir.path())
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
+    }
+}
