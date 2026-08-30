@@ -29,14 +29,17 @@ jobs:
           rustup show active-toolchain
           cargo --version
 
-      - name: Build Git UI crate
-        run: cargo build -p git_ui --quiet
+      - name: Build Git and Git UI crates
+        run: cargo build -p git -p git_ui --quiet
+
+      - name: Run Git tests
+        run: cargo test -p git --lib --quiet
 
       - name: Run Git UI tests
         run: cargo test -p git_ui --lib --quiet
 
       - name: Format check
-        run: cargo fmt --check -p git_ui
+        run: cargo fmt --check -p git -p git_ui -p project
 
   clippy-linux:
     runs-on: ubuntu-latest
