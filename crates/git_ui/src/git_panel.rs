@@ -43,7 +43,7 @@ use git::{
 };
 use git::{
     ExpandCommitEditor, GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll,
-    StashAll, StashApply, StashPop, StashStaged, StashTracked, ToggleFillCommitEditor,
+    StashAll, StashApply, StashFile, StashPop, StashStaged, StashTracked, ToggleFillCommitEditor,
     TrashUntrackedFiles, UnstageAll, ViewFile, parse_git_remote_url,
 };
 use gpui::{
@@ -201,29 +201,52 @@ struct GitPanelViewOptionsMenuState {
     tree_view: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum StashKind {
     All,
     Tracked,
     Staged,
+    Selected(Vec<RepoPath>),
 }
 
 impl StashKind {
-    fn title(self) -> &'static str {
+    fn title(&self) -> &'static str {
         match self {
             StashKind::All => "Stash All",
             StashKind::Tracked => "Stash Tracked",
             StashKind::Staged => "Stash Staged",
+            StashKind::Selected(_) => "Stash Selected",
         }
     }
 
-    fn error_action(self) -> &'static str {
+    fn error_action(&self) -> &'static str {
         match self {
             StashKind::All => "stash",
             StashKind::Tracked => "stash tracked",
             StashKind::Staged => "stash staged",
+            StashKind::Selected(_) => "stash selected",
         }
     }
+}
+
+fn validate_selected_stash_paths(
+    active_repository_id: RepositoryId,
+    selected_paths: impl IntoIterator<Item = (RepositoryId, RepoPath)>,
+) -> anyhow::Result<Vec<RepoPath>> {
+    let mut paths = Vec::new();
+    for (repository_id, path) in selected_paths {
+        anyhow::ensure!(
+            repository_id == active_repository_id,
+            "selected files span multiple repositories; stash them separately"
+        );
+        anyhow::ensure!(
+            !path.is_empty(),
+            "cannot stash an empty or invalid selected path"
+        );
+        paths.push(path);
+    }
+    anyhow::ensure!(!paths.is_empty(), "no valid files selected to stash");
+    Ok(paths)
 }
 
 /// Prompts for an optional stash name. Confirming with an empty editor stashes
@@ -260,7 +283,7 @@ impl StashMessageModal {
     fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
         let message = self.editor.read(cx).text(cx).trim().to_owned();
         let message = (!message.is_empty()).then_some(message);
-        let kind = self.kind;
+        let kind = self.kind.clone();
         self.panel
             .update(cx, |panel, cx| panel.perform_stash(kind, message, cx))
             .ok();
@@ -1318,7 +1341,9 @@ impl GitPanel {
                 move |this, _git_store, event, window, cx| match event {
                     GitStoreEvent::RepositoryUpdated(
                         _,
-                        RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
+                        RepositoryEvent::StatusesChanged
+                        | RepositoryEvent::HeadChanged
+                        | RepositoryEvent::StashEntriesChanged,
                         true,
                     )
                     | GitStoreEvent::RepositoryAdded
@@ -2952,6 +2977,51 @@ impl GitPanel {
         self.prompt_for_stash_message(StashKind::Staged, window, cx);
     }
 
+    pub fn stash_selected(&mut self, _: &StashFile, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+        let Some(selected_index) = self.selected_entry else {
+            self.show_error_toast(
+                "stash selected",
+                anyhow::anyhow!("no files selected to stash"),
+                cx,
+            );
+            return;
+        };
+        let repository_id = active_repository.read(cx).id;
+        let selected_paths: Vec<_> =
+            if let Some(descendants) = self.directory_descendants(selected_index) {
+                descendants
+                    .iter()
+                    .map(|entry| (repository_id, entry.repo_path.clone()))
+                    .collect()
+            } else if let Some(entry) = self
+                .entries
+                .get(selected_index)
+                .and_then(GitListEntry::status_entry)
+            {
+                vec![(repository_id, entry.repo_path.clone())]
+            } else if let Some(GitListEntry::Header(section)) = self.entries.get(selected_index) {
+                let repo = active_repository.read(cx);
+                self.change_entries_by_path()
+                    .filter(|entry| section.contains(entry, &repo))
+                    .map(|entry| (repository_id, entry.repo_path.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        let paths = match validate_selected_stash_paths(repository_id, selected_paths) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.show_error_toast("stash selected", error, cx);
+                return;
+            }
+        };
+        self.prompt_for_stash_message(StashKind::Selected(paths), window, cx);
+    }
+
     fn prompt_for_stash_message(
         &mut self,
         kind: StashKind,
@@ -2982,17 +3052,19 @@ impl GitPanel {
 
         cx.spawn({
             async move |this, cx| {
+                let error_action = kind.error_action();
                 let stash_task = active_repository
                     .update(cx, |repo, cx| match kind {
                         StashKind::All => repo.stash_all(message, cx),
                         StashKind::Tracked => repo.stash_tracked(message, cx),
                         StashKind::Staged => repo.stash_staged(message, cx),
+                        StashKind::Selected(paths) => repo.stash_entries(paths, message, cx),
                     })
                     .await;
                 this.update(cx, |this, cx| {
                     stash_task
                         .map_err(|e| {
-                            this.show_error_toast(kind.error_action(), e, cx);
+                            this.show_error_toast(error_action, e, cx);
                         })
                         .ok();
                     cx.notify();
@@ -13667,5 +13739,59 @@ mod tests {
                 Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }),
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod stash_selection_tests {
+    use super::{RepoPath, RepositoryId, validate_selected_stash_paths};
+
+    fn path(value: &str) -> RepoPath {
+        RepoPath::new(value).unwrap()
+    }
+
+    #[test]
+    fn rejects_an_empty_selection() {
+        let error = validate_selected_stash_paths(RepositoryId(1), Vec::new()).unwrap_err();
+        assert_eq!(error.to_string(), "no valid files selected to stash");
+    }
+
+    #[test]
+    fn rejects_empty_or_invalid_paths_without_stashing() {
+        let error = validate_selected_stash_paths(RepositoryId(1), [(RepositoryId(1), path(""))])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cannot stash an empty or invalid selected path"
+        );
+    }
+
+    #[test]
+    fn rejects_paths_from_multiple_repositories_before_stashing() {
+        let error = validate_selected_stash_paths(
+            RepositoryId(1),
+            [
+                (RepositoryId(1), path("selected.txt")),
+                (RepositoryId(2), path("other.txt")),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "selected files span multiple repositories; stash them separately"
+        );
+    }
+
+    #[test]
+    fn preserves_exact_selected_path_order() {
+        let paths = validate_selected_stash_paths(
+            RepositoryId(1),
+            [
+                (RepositoryId(1), path("renamed.txt")),
+                (RepositoryId(1), path("deleted.txt")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(paths, [path("renamed.txt"), path("deleted.txt")]);
     }
 }
