@@ -1312,7 +1312,7 @@ fn graph_jump_targets<'a>(
     head_sha: Option<&'a SharedString>,
     branch: Option<&'a Branch>,
     branches: &'a [Branch],
-    merge_heads: impl Iterator<Item = Option<&'a SharedString>>,
+    mut merge_heads: impl Iterator<Item = Option<&'a SharedString>>,
 ) -> GraphJumpTargets {
     let head = head_sha.and_then(graph_jump_oid);
 
