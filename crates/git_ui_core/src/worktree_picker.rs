@@ -1073,7 +1073,7 @@ impl PickerDelegate for WorktreePickerDelegate {
 
             if !repo_worktrees.is_empty() {
                 let project_paths = &self.project_worktree_paths;
-                let (mut open_here, mut others): (Vec<_>, Vec<_>) = self
+                let (mut open_here, others): (Vec<_>, Vec<_>) = self
                     .sorted_worktree_rows()
                     .into_iter()
                     .partition(|row| project_paths.contains(&row.worktree.path));
@@ -2125,7 +2125,7 @@ mod tests {
         cx: &mut VisualTestContext,
     ) -> bool {
         let worktrees = repository
-            .update(cx, |repository, cx| repository.worktrees_unqueued(cx))
+            .update(cx, |repository, _| repository.worktrees())
             .await
             .unwrap()
             .unwrap();
