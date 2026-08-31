@@ -12821,6 +12821,7 @@ mod tests {
         });
 
         cx.run_until_parked();
+        register_git_commit_language(&project, &mut cx);
         let panel = workspace.update_in(&mut cx, GitPanel::new);
         workspace.update_in(&mut cx, |workspace, window, cx| {
             workspace.add_panel(panel.clone(), window, cx);
