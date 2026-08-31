@@ -3418,6 +3418,14 @@ impl GitPanel {
             return;
         };
         let action_repository_id = action_repository.read(cx).id;
+        if self.active_repository_id != Some(action_repository_id) {
+            // Commit buffers, drafts, templates, and amend state are owned by
+            // the active repository. Switch before reading or clearing the
+            // editor so a selected repository action cannot consume another
+            // repository's draft.
+            self.activate_repository(action_repository_id, cx);
+            return;
+        }
         let error_spawn = |message, window: &mut Window, cx: &mut App| {
             let prompt = window.prompt(PromptLevel::Warning, message, None, &["OK"], cx);
             cx.spawn(async move |_| {
@@ -13245,7 +13253,8 @@ mod tests {
         });
 
         // Keep A active while the selected B header names the action target.
-        // The commit must not stage or commit A's identical relative path.
+        // Selecting B for a commit must bind the existing per-repository commit
+        // editor before mutating either repository, so A's saved draft survives.
         repository_a.update(&mut cx, |repository, cx| {
             repository.set_as_active_repository(cx)
         });
@@ -13268,12 +13277,48 @@ mod tests {
             panel.selected_entry = Some(repository_b_header_index);
             panel
                 .commit_message_buffer(cx)
+                .update(cx, |buffer, cx| buffer.set_text("Draft for repository A", cx));
+            let focus_handle = panel.commit_editor.focus_handle(cx);
+            focus_handle.focus(window, cx);
+            assert!(panel.commit(&focus_handle, window, cx));
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        cx.run_until_parked();
+        assert_eq!(
+            project.read_with(&cx, |project, cx| {
+                project
+                    .active_repository(cx)
+                    .map(|repository| repository.read(cx).id)
+            }),
+            Some(repository_b_id),
+            "a selected B commit action must first bind B's per-repository editor"
+        );
+        let a_draft_after_target_switch = repository_a.read_with(&cx, |repository, cx| {
+            repository
+                .commit_message_buffer()
+                .expect("repository A commit buffer should remain open")
+                .read(cx)
+                .text()
+        });
+        assert_eq!(a_draft_after_target_switch, "Draft for repository A");
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel
+                .commit_message_buffer(cx)
                 .update(cx, |buffer, cx| buffer.set_text("Commit repository B", cx));
             let focus_handle = panel.commit_editor.focus_handle(cx);
             focus_handle.focus(window, cx);
             assert!(panel.commit(&focus_handle, window, cx));
         });
         cx.run_until_parked();
+        let a_draft_after_b_commit = repository_a.read_with(&cx, |repository, cx| {
+            repository
+                .commit_message_buffer()
+                .expect("repository A commit buffer should remain open")
+                .read(cx)
+                .text()
+        });
+        assert_eq!(a_draft_after_b_commit, "Draft for repository A");
         let a_commit_count = fs
             .with_git_state(Path::new(path!("/root/project-a/.git")), false, |state| {
                 state.commit_history.len()
