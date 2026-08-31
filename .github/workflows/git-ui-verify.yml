@@ -1,0 +1,33 @@
+name: git-ui-verify
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - staging
+    paths:
+      - "crates/git_ui_core/src/worktree_picker.rs"
+      - "crates/project/src/git_store.rs"
+      - ".github/workflows/git-ui-verify.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  git-ui:
+    name: Git UI focused checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check --package git_ui_core --package project
+
+      - name: Run focused worktree picker test
+        run: cargo test -p git_ui_core worktree_picker_ --lib
