@@ -597,6 +597,101 @@ enum Section {
     Unstaged,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+enum GitPanelEntryKind {
+    Status,
+    Directory,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+struct GitPanelEntryId {
+    repo_id: RepositoryId,
+    path: RepoPath,
+    section: Option<Section>,
+    kind: GitPanelEntryKind,
+}
+
+fn reconcile_selection(
+    selected: &mut Option<GitPanelEntryId>,
+    marked: &mut Vec<GitPanelEntryId>,
+    anchor: &mut Option<GitPanelEntryId>,
+    visible: &[GitPanelEntryId],
+) {
+    let marked_set: HashSet<_> = std::mem::take(marked).into_iter().collect();
+    *marked = visible
+        .iter()
+        .filter(|entry| marked_set.contains(*entry))
+        .cloned()
+        .collect();
+
+    let selected_was_removed = selected
+        .as_ref()
+        .is_some_and(|entry| !visible.contains(entry));
+    if selected_was_removed {
+        *selected = marked.first().cloned();
+    }
+    if selected_was_removed
+        || anchor
+            .as_ref()
+            .is_some_and(|entry| !visible.contains(entry))
+    {
+        *anchor = selected.clone();
+    }
+}
+
+fn update_selection(
+    selected: &mut Option<GitPanelEntryId>,
+    marked: &mut Vec<GitPanelEntryId>,
+    anchor: &mut Option<GitPanelEntryId>,
+    visible: &[GitPanelEntryId],
+    target: GitPanelEntryId,
+    shift: bool,
+    toggle: bool,
+) {
+    let Some(target_index) = visible.iter().position(|entry| entry == &target) else {
+        return;
+    };
+
+    if shift {
+        // The current selection is the range anchor.  Prefer it over the
+        // cached anchor so keyboard navigation and auto-selection cannot
+        // leave Shift selection rooted at a stale row.
+        let range_anchor = selected
+            .as_ref()
+            .filter(|entry| visible.contains(entry))
+            .or_else(|| anchor.as_ref().filter(|entry| visible.contains(entry)));
+        if let Some(anchor_id) = range_anchor {
+            if let Some(anchor_index) = visible.iter().position(|entry| entry == anchor_id) {
+                let range = if anchor_index <= target_index {
+                    anchor_index..=target_index
+                } else {
+                    target_index..=anchor_index
+                };
+                *marked = visible[range].to_vec();
+                *anchor = Some(anchor_id.clone());
+            } else {
+                *marked = vec![target.clone()];
+                *anchor = Some(target.clone());
+            }
+        } else {
+            *marked = vec![target.clone()];
+            *anchor = Some(target.clone());
+        }
+    } else if toggle {
+        if let Some(index) = marked.iter().position(|entry| entry == &target) {
+            marked.remove(index);
+        } else {
+            marked.push(target.clone());
+        }
+        *anchor = Some(target.clone());
+    } else {
+        *marked = vec![target.clone()];
+        *anchor = Some(target.clone());
+    }
+
+    *selected = Some(target);
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct GitHeaderEntry {
     header: Section,
@@ -1075,8 +1170,11 @@ pub struct GitPanel {
     pub(crate) project: Entity<Project>,
     scroll_handle: UniformListScrollHandle,
     max_width_item_index: Option<usize>,
+    // The row index is a derived cursor; identity fields below are the selection source of truth.
     selected_entry: Option<usize>,
-    marked_entries: Vec<usize>,
+    selected_entry_id: Option<GitPanelEntryId>,
+    marked_entries: Vec<GitPanelEntryId>,
+    selection_anchor: Option<GitPanelEntryId>,
     tracked_count: usize,
     tracked_staged_count: usize,
     update_visible_entries_task: Task<()>,
@@ -1378,7 +1476,9 @@ impl GitPanel {
                 scroll_handle,
                 max_width_item_index: None,
                 selected_entry: None,
+                selected_entry_id: None,
                 marked_entries: Vec::new(),
+                selection_anchor: None,
                 tracked_count: 0,
                 tracked_staged_count: 0,
                 update_visible_entries_task: Task::ready(()),
@@ -1426,6 +1526,61 @@ impl GitPanel {
             .find(|entry| entry.section == section)
             .map(|entry| entry.index)
     }
+    fn entry_identity(&self, index: usize, repo_id: RepositoryId) -> Option<GitPanelEntryId> {
+        let entry = self.entries.get(index)?;
+        let kind = match entry {
+            GitListEntry::Status(_) | GitListEntry::TreeStatus(_) => GitPanelEntryKind::Status,
+            GitListEntry::Directory(_) => GitPanelEntryKind::Directory,
+            GitListEntry::Header(_) | GitListEntry::EmptySection(_) => return None,
+        };
+        Some(GitPanelEntryId {
+            repo_id,
+            path: entry.repo_path()?.clone(),
+            section: self.section_for_entry_index(index),
+            kind,
+        })
+    }
+
+    fn visible_selectable_entry_ids(&self, repo_id: RepositoryId) -> Vec<GitPanelEntryId> {
+        let indices = match &self.view_mode {
+            GitPanelViewMode::Flat => self.visible_flat_entry_indices(),
+            GitPanelViewMode::Tree(state) => state.logical_indices.clone(),
+        };
+        indices
+            .into_iter()
+            .filter(|&index| self.entries[index].is_selectable())
+            .filter_map(|index| self.entry_identity(index, repo_id))
+            .collect()
+    }
+
+    fn set_selected_entry_index(&mut self, index: usize, repo_id: RepositoryId) {
+        self.selected_entry = Some(index);
+        self.selected_entry_id = self.entry_identity(index, repo_id);
+        self.selection_anchor = self.selected_entry_id.clone();
+    }
+
+    fn select_entry_from_pointer(
+        &mut self,
+        index: usize,
+        shift: bool,
+        toggle: bool,
+        repo_id: RepositoryId,
+    ) {
+        let Some(target) = self.entry_identity(index, repo_id) else {
+            return;
+        };
+        let visible = self.visible_selectable_entry_ids(repo_id);
+        update_selection(
+            &mut self.selected_entry_id,
+            &mut self.marked_entries,
+            &mut self.selection_anchor,
+            &visible,
+            target,
+            shift,
+            toggle,
+        );
+        self.selected_entry = Some(index);
+    }
 
     pub fn select_entry_by_path(
         &mut self,
@@ -1433,7 +1588,7 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(git_repo) = self.active_repository.as_ref() else {
+        let Some(git_repo) = self.active_repository.clone() else {
             return;
         };
 
@@ -1505,7 +1660,7 @@ impl GitPanel {
             return;
         };
 
-        self.selected_entry = Some(ix);
+        self.set_selected_entry_index(ix, git_repo.read(cx).id);
         self.scroll_to_selected_entry(cx);
     }
 
@@ -1754,6 +1909,12 @@ impl GitPanel {
 
         if let Some(index) = self.directory_entry_index(&directory_key) {
             self.selected_entry = Some(index);
+            self.selected_entry_id = self
+                .active_repository
+                .as_ref()
+                .map(|repo| repo.read(cx).id)
+                .and_then(|repo_id| self.entry_identity(index, repo_id));
+            self.selection_anchor = self.selected_entry_id.clone();
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -1783,6 +1944,12 @@ impl GitPanel {
 
         if let Some(first_entry) = first_entry {
             self.selected_entry = Some(first_entry);
+            self.selected_entry_id = self
+                .active_repository
+                .as_ref()
+                .map(|repo| repo.read(cx).id)
+                .and_then(|repo_id| self.entry_identity(first_entry, repo_id));
+            self.selection_anchor = self.selected_entry_id.clone();
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -1862,6 +2029,12 @@ impl GitPanel {
         };
 
         self.selected_entry = Some(candidate);
+        self.selected_entry_id = self
+            .active_repository
+            .as_ref()
+            .map(|repo| repo.read(cx).id)
+            .and_then(|repo_id| self.entry_identity(candidate, repo_id));
+        self.selection_anchor = self.selected_entry_id.clone();
         self.scroll_to_selected_entry(cx);
     }
 
@@ -1940,6 +2113,12 @@ impl GitPanel {
         };
 
         self.selected_entry = Some(candidate);
+        self.selected_entry_id = self
+            .active_repository
+            .as_ref()
+            .map(|repo| repo.read(cx).id)
+            .and_then(|repo_id| self.entry_identity(candidate, repo_id));
+        self.selection_anchor = self.selected_entry_id.clone();
         self.scroll_to_selected_entry(cx);
     }
 
@@ -1957,6 +2136,12 @@ impl GitPanel {
 
         if let Some(last_entry) = last_entry {
             self.selected_entry = Some(last_entry);
+            self.selected_entry_id = self
+                .active_repository
+                .as_ref()
+                .map(|repo| repo.read(cx).id)
+                .and_then(|repo_id| self.entry_identity(last_entry, repo_id));
+            self.selection_anchor = self.selected_entry_id.clone();
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -4851,10 +5036,15 @@ impl GitPanel {
 
     fn update_visible_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path_style = self.project.read(cx).path_style(cx);
-        let selected_change = self.selected_entry.and_then(|index| {
-            let entry = self.entries.get(index)?.status_entry()?;
-            Some((entry.repo_path.clone(), self.section_for_entry_index(index)))
+        let active_repo_id = self.active_repository.as_ref().map(|repo| repo.read(cx).id);
+        let selected_entry_id = self.selected_entry_id.clone().or_else(|| {
+            active_repo_id.and_then(|repo_id| {
+                self.selected_entry
+                    .and_then(|index| self.entry_identity(index, repo_id))
+            })
         });
+        let mut marked_entries = self.marked_entries.clone();
+        let mut selection_anchor = self.selection_anchor.clone();
         let bulk_staging = self.bulk_staging.take();
         let last_staged_path_prev_index = bulk_staging
             .as_ref()
@@ -4923,6 +5113,10 @@ impl GitPanel {
 
         let Some(repo) = self.active_repository.as_ref() else {
             // Just clear entries if no repository is active.
+            self.selected_entry = None;
+            self.selected_entry_id = None;
+            self.marked_entries.clear();
+            self.selection_anchor = None;
             cx.notify();
             return;
         };
@@ -5201,11 +5395,27 @@ impl GitPanel {
             self.bulk_staging = bulk_staging;
         }
 
-        if let Some((path, section)) = selected_change {
-            self.selected_entry = section
-                .and_then(|section| self.entry_by_path_in_section(&path, section))
-                .or_else(|| self.entry_by_path(&path));
+        let mut selected_entry_id = selected_entry_id;
+        if let Some(repo_id) = active_repo_id {
+            let visible = self.visible_selectable_entry_ids(repo_id);
+            reconcile_selection(
+                &mut selected_entry_id,
+                &mut marked_entries,
+                &mut selection_anchor,
+                &visible,
+            );
+            self.selected_entry = selected_entry_id.as_ref().and_then(|entry| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .position(|(index, _candidate)| {
+                        self.entry_identity(index, repo_id).as_ref() == Some(entry)
+                    })
+            });
         }
+        self.selected_entry_id = selected_entry_id;
+        self.marked_entries = marked_entries;
+        self.selection_anchor = selection_anchor;
         self.select_first_entry_if_none(window, cx);
         self.select_last_entry_if_out_of_bounds(window, cx);
 
@@ -7634,6 +7844,12 @@ impl GitPanel {
     ) {
         if matches!(self.entries.get(ix), Some(GitListEntry::Directory(_))) {
             self.selected_entry = Some(ix);
+            self.selected_entry_id = self
+                .active_repository
+                .as_ref()
+                .map(|repo| repo.read(cx).id)
+                .and_then(|repo_id| self.entry_identity(ix, repo_id));
+            self.selection_anchor = self.selected_entry_id.clone();
             self.deploy_panel_context_menu(position, Some(ix), true, window, cx);
             return;
         }
@@ -7694,6 +7910,12 @@ impl GitPanel {
                 })
         });
         self.selected_entry = Some(ix);
+        self.selected_entry_id = self
+            .active_repository
+            .as_ref()
+            .map(|repo| repo.read(cx).id)
+            .and_then(|repo_id| self.entry_identity(ix, repo_id));
+        self.selection_anchor = self.selected_entry_id.clone();
         self.set_context_menu(context_menu, position, None, window, cx);
     }
 
@@ -7789,7 +8011,9 @@ impl GitPanel {
         let display_name = entry.display_name(path_style);
 
         let selected = self.selected_entry == Some(ix);
-        let marked = self.marked_entries.contains(&ix);
+        let marked = self
+            .entry_identity(ix, repo.id)
+            .is_some_and(|entry| self.marked_entries.contains(&entry));
         let status_style = settings.status_style;
         let status = entry.status;
         let file_icon = if settings.file_icons {
@@ -8014,9 +8238,17 @@ impl GitPanel {
             )
             .on_click({
                 cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    this.selected_entry = Some(ix);
+                    let shift = event.modifiers().shift;
+                    let toggle = event.modifiers().secondary();
+                    if let Some(repo_id) =
+                        this.active_repository.as_ref().map(|repo| repo.read(cx).id)
+                    {
+                        this.select_entry_from_pointer(ix, shift, toggle, repo_id);
+                    }
                     cx.notify();
-                    this.open_selected_entry_on_click(event.modifiers().secondary(), window, cx);
+                    if !shift && !toggle {
+                        this.open_selected_entry_on_click(false, window, cx);
+                    }
                 })
             })
             .on_mouse_down(
@@ -8047,7 +8279,6 @@ impl GitPanel {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        // TODO: Have not yet plugged in self.marked_entries. Not sure when and why we need that
         let selected = self.selected_entry == Some(ix);
         let label_color = Color::Muted;
 
@@ -8203,9 +8434,17 @@ impl GitPanel {
             )
             .on_click({
                 let key = entry.key.clone();
-                cx.listener(move |this, _event: &ClickEvent, window, cx| {
-                    this.selected_entry = Some(ix);
-                    this.toggle_directory(&key, window, cx);
+                cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    let shift = event.modifiers().shift;
+                    let toggle = event.modifiers().secondary();
+                    if let Some(repo_id) =
+                        this.active_repository.as_ref().map(|repo| repo.read(cx).id)
+                    {
+                        this.select_entry_from_pointer(ix, shift, toggle, repo_id);
+                    }
+                    if !shift && !toggle {
+                        this.toggle_directory(&key, window, cx);
+                    }
                 })
             })
             .on_mouse_down(
@@ -10286,7 +10525,7 @@ mod tests {
         let panel = workspace.update_in(&mut cx, GitPanel::new);
         await_git_panel_entries(&panel, &mut cx).await;
 
-        let entries = panel.read_with(&mut cx, |panel, _| {
+        let entries = panel.read_with(&mut cx, |panel, cx| {
             assert_eq!(panel.entry_count, 6);
             assert_eq!(
                 panel
@@ -10316,6 +10555,19 @@ mod tests {
                     },
                 ]
             );
+            let repo_id = panel
+                .active_repository
+                .as_ref()
+                .expect("active repository should exist")
+                .read(cx)
+                .id;
+            let visible = panel.visible_selectable_entry_ids(repo_id);
+            let partial_ids = visible
+                .iter()
+                .filter(|entry| entry.path == partial_path)
+                .collect::<Vec<_>>();
+            assert_eq!(partial_ids.len(), 2);
+            assert_ne!(partial_ids[0], partial_ids[1]);
             assert_eq!(
                 panel.stage_intent_for_entry_index(projections[0].index),
                 StageIntent::Unstage
@@ -10422,6 +10674,31 @@ mod tests {
                 panel.entry_by_path_in_section(&repo_path("partial.rs"), Section::Staged);
         });
 
+        panel.update_in(&mut cx, |panel, _window, cx| {
+            let repo_id = panel
+                .active_repository
+                .as_ref()
+                .expect("active repository should exist")
+                .read(cx)
+                .id;
+            let staged_index = panel
+                .entry_by_path_in_section(&repo_path("partial.rs"), Section::Staged)
+                .expect("staged projection should exist");
+            let unstaged_index = panel
+                .entry_by_path_in_section(&repo_path("partial.rs"), Section::Unstaged)
+                .expect("unstaged projection should exist");
+            let staged_id = panel
+                .entry_identity(staged_index, repo_id)
+                .expect("staged identity should exist");
+            let unstaged_id = panel
+                .entry_identity(unstaged_index, repo_id)
+                .expect("unstaged identity should exist");
+            assert_ne!(staged_id, unstaged_id);
+            panel.selected_entry = Some(staged_index);
+            panel.selected_entry_id = Some(staged_id.clone());
+            panel.marked_entries = vec![staged_id.clone(), unstaged_id];
+            panel.selection_anchor = Some(staged_id);
+        });
         fs.set_status_for_repo(
             path!("/project/.git").as_ref(),
             &[
@@ -10460,6 +10737,15 @@ mod tests {
                 panel.selected_entry,
                 panel.entry_by_path_in_section(&repo_path("partial.rs"), Section::Unstaged)
             );
+            let selected_id = panel
+                .selected_entry_id
+                .clone()
+                .expect("selected identity should remain after refresh");
+            assert_eq!(selected_id.path, repo_path("partial.rs"));
+            assert_eq!(selected_id.section, Some(Section::Unstaged));
+            assert_eq!(selected_id.kind, GitPanelEntryKind::Status);
+            assert_eq!(panel.marked_entries, vec![selected_id.clone()]);
+            assert_eq!(panel.selection_anchor, Some(selected_id));
         });
     }
 
@@ -13667,5 +13953,204 @@ mod tests {
                 Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }),
             ],
         );
+    }
+    fn selection_test_entry(repo_id: u64, path: &str) -> GitPanelEntryId {
+        selection_test_entry_in_section(repo_id, path, None)
+    }
+
+    fn selection_test_entry_in_section(
+        repo_id: u64,
+        path: &str,
+        section: Option<Section>,
+    ) -> GitPanelEntryId {
+        GitPanelEntryId {
+            repo_id: RepositoryId(repo_id),
+            path: repo_path(path),
+            section,
+            kind: GitPanelEntryKind::Status,
+        }
+    }
+
+    #[test]
+    fn test_multi_selection_identity_includes_repository_and_projection() {
+        let first_repo = selection_test_entry(1, "src/lib.rs");
+        let second_repo = selection_test_entry(2, "src/lib.rs");
+        let staged_projection =
+            selection_test_entry_in_section(1, "src/lib.rs", Some(Section::Staged));
+        let unstaged_projection =
+            selection_test_entry_in_section(1, "src/lib.rs", Some(Section::Unstaged));
+
+        assert_ne!(first_repo, second_repo);
+        assert_ne!(first_repo, staged_projection);
+        assert_ne!(staged_projection, unstaged_projection);
+
+        let visible = vec![staged_projection.clone(), unstaged_projection.clone()];
+        let mut selected = Some(staged_projection.clone());
+        let mut marked = vec![staged_projection.clone()];
+        let mut anchor = Some(staged_projection);
+        update_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &visible,
+            unstaged_projection,
+            true,
+            false,
+        );
+        assert_eq!(marked, visible);
+    }
+
+    #[test]
+    fn test_multi_selection_survives_refresh_reorder_and_removal() {
+        let first = selection_test_entry(1, "a.rs");
+        let removed = selection_test_entry(1, "b.rs");
+        let remaining = selection_test_entry(1, "c.rs");
+        let duplicate_path_other_repo = selection_test_entry(2, "a.rs");
+        let mut selected = Some(first.clone());
+        let mut marked = vec![
+            first.clone(),
+            removed,
+            remaining.clone(),
+            duplicate_path_other_repo.clone(),
+        ];
+        let mut anchor = Some(first.clone());
+
+        reconcile_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &[
+                duplicate_path_other_repo.clone(),
+                remaining.clone(),
+                first.clone(),
+            ],
+        );
+
+        assert_eq!(selected, Some(first.clone()));
+        assert_eq!(
+            marked,
+            vec![duplicate_path_other_repo, remaining, first.clone()]
+        );
+        assert_eq!(anchor, Some(first));
+    }
+
+    #[test]
+    fn test_multi_selection_shift_click_selects_visible_range() {
+        let first = selection_test_entry(1, "a.rs");
+        let second = selection_test_entry(1, "b.rs");
+        let third = selection_test_entry(1, "c.rs");
+        let fourth = selection_test_entry(1, "d.rs");
+        let visible = vec![first.clone(), second, third, fourth.clone()];
+        let mut selected = Some(first.clone());
+        let mut marked = vec![first.clone()];
+        let mut anchor = Some(first.clone());
+
+        update_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &visible,
+            fourth.clone(),
+            true,
+            false,
+        );
+
+        assert_eq!(selected, Some(fourth));
+        assert_eq!(marked, visible);
+        assert_eq!(anchor, Some(first));
+    }
+
+    #[test]
+    fn test_multi_selection_shift_click_prefers_current_selection_over_stale_anchor() {
+        let first = selection_test_entry(1, "a.rs");
+        let second = selection_test_entry(1, "b.rs");
+        let third = selection_test_entry(1, "c.rs");
+        let visible = vec![first.clone(), second.clone(), third.clone()];
+        let mut selected = Some(second.clone());
+        let mut marked = vec![second];
+        let mut anchor = Some(first);
+
+        update_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &visible,
+            third,
+            true,
+            false,
+        );
+
+        assert_eq!(selected, Some(visible[2].clone()));
+        assert_eq!(marked, visible[1..].to_vec());
+        assert_eq!(anchor, Some(visible[1].clone()));
+    }
+    #[test]
+    fn test_multi_selection_shift_click_uses_selected_row_when_anchor_is_missing() {
+        let first = selection_test_entry(1, "a.rs");
+        let second = selection_test_entry(1, "b.rs");
+        let third = selection_test_entry(1, "c.rs");
+        let visible = vec![first, second.clone(), third.clone()];
+        let mut selected = Some(second.clone());
+        let mut marked = vec![second];
+        let mut anchor = None;
+
+        update_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &visible,
+            third,
+            true,
+            false,
+        );
+
+        assert_eq!(selected, Some(visible[2].clone()));
+        assert_eq!(marked, visible[1..].to_vec());
+        assert_eq!(anchor, Some(visible[1].clone()));
+    }
+
+    #[test]
+    fn test_multi_selection_refresh_reanchors_after_selected_row_removal() {
+        let removed = selection_test_entry(1, "removed.rs");
+        let replacement = selection_test_entry(1, "replacement.rs");
+        let stale_anchor = selection_test_entry(1, "stale-anchor.rs");
+        let mut selected = Some(removed.clone());
+        let mut marked = vec![removed, replacement.clone()];
+        let mut anchor = Some(stale_anchor);
+
+        reconcile_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            std::slice::from_ref(&replacement),
+        );
+
+        assert_eq!(selected, Some(replacement.clone()));
+        assert_eq!(marked, vec![replacement.clone()]);
+        assert_eq!(anchor, Some(replacement));
+    }
+    #[test]
+    fn test_multi_selection_toggle_click_removes_only_target() {
+        let first = selection_test_entry(1, "a.rs");
+        let second = selection_test_entry(1, "b.rs");
+        let third = selection_test_entry(1, "c.rs");
+        let visible = vec![first.clone(), second.clone(), third.clone()];
+        let mut selected = Some(first.clone());
+        let mut marked = vec![first.clone(), second.clone(), third.clone()];
+        let mut anchor = Some(first.clone());
+
+        update_selection(
+            &mut selected,
+            &mut marked,
+            &mut anchor,
+            &visible,
+            second.clone(),
+            false,
+            true,
+        );
+
+        assert_eq!(selected, Some(second.clone()));
+        assert_eq!(marked, vec![first, third]);
+        assert_eq!(anchor, Some(second));
     }
 }
