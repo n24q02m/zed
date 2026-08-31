@@ -15,6 +15,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     env:
+      CARGO_HOME: C:/c
       CARGO_INCREMENTAL: "0"
     steps:
       - name: Check out immutable verifier trigger
@@ -66,6 +67,10 @@ jobs:
           if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
             throw "MSVC compiler was unavailable after entering the Visual Studio developer shell"
           }
+          # Cargo's default user-profile cache cannot check out the pinned
+          # dependency fixture within Windows MAX_PATH. Keep only Cargo's cache
+          # at this short job-local root; rustup remains at the runner default.
+          New-Item -ItemType Directory -Force $env:CARGO_HOME | Out-Null
           $testLog = Join-Path $env:RUNNER_TEMP "fork-git-ui-targeted-test.log"
           & cargo test -p git_ui tests::test_show_all_repositories_preserves_repository_identity_when_staging --lib -- --exact 2>&1 | Tee-Object -FilePath $testLog
           if ($LASTEXITCODE -ne 0) {
