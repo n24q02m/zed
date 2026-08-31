@@ -8,6 +8,9 @@ on:
         description: Exact 40-character fork commit SHA to build
         required: true
         type: string
+  push:
+    branches:
+      - verify/windows-ui-smoke
 
 permissions:
   contents: read
@@ -20,12 +23,13 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       RELEASE_VERSION: "0.0.0"
+      TARGET_COMMIT: ${{ inputs.commit || github.event.head_commit.message }}
       ZED_WORKSPACE: ${{ github.workspace }}
     steps:
       - name: Check out requested fork commit
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          ref: ${{ inputs.commit }}
+          ref: ${{ env.TARGET_COMMIT }}
           fetch-depth: 1
           clean: false
 
@@ -33,7 +37,7 @@ jobs:
         id: source
         shell: pwsh
         run: |
-          $expected = "${{ inputs.commit }}".Trim().ToLowerInvariant()
+          $expected = "${{ env.TARGET_COMMIT }}".Trim().ToLowerInvariant()
           if ($expected -notmatch "^[0-9a-f]{40}$") {
             throw "commit must be a 40-character lowercase or uppercase SHA"
           }
