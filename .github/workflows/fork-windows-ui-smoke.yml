@@ -19,7 +19,7 @@ jobs:
   bundle:
     name: Bundle exact fork head for UI smoke evidence
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       CARGO_HOME: C:/c
       CARGO_INCREMENTAL: "0"
