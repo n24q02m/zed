@@ -1560,6 +1560,18 @@ impl GitPanel {
         self.repository_for_id(self.repository_id_for_entry_index(ix)?, cx)
     }
 
+    fn action_repository(&self, cx: &App) -> Option<Entity<Repository>> {
+        if GitPanelSettings::get_global(cx).show_all_repositories
+            && let Some(selected_entry) = self.selected_entry
+        {
+            // A selected row without a live repository is unavailable. Falling
+            // back to the active repository here would apply a global action to
+            // the wrong repository after an all-repositories refresh.
+            return self.repository_for_entry_index(selected_entry, cx);
+        }
+        self.active_repository.clone()
+    }
+
     fn repository_local_entry_index(
         &self,
         ix: usize,
@@ -2786,14 +2798,14 @@ impl GitPanel {
     }
 
     fn change_all_files_stage(&mut self, stage: bool, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
+        let Some(action_repository) = self.action_repository(cx) else {
             return;
         };
         cx.spawn({
             async move |this, cx| {
                 let result = this
                     .update(cx, |_this, cx| {
-                        active_repository.update(cx, |repo, cx| {
+                        action_repository.update(cx, |repo, cx| {
                             if stage {
                                 repo.stage_all(cx)
                             } else {
@@ -2807,7 +2819,9 @@ impl GitPanel {
                     if let Err(err) = result {
                         this.show_error_toast(if stage { "add" } else { "reset" }, err, cx);
                     }
-                    this.update_counts(active_repository.read(cx));
+                    if this.active_repository_id == Some(action_repository.read(cx).id) {
+                        this.update_counts(action_repository.read(cx));
+                    }
                     cx.notify()
                 })
             }
@@ -3076,13 +3090,13 @@ impl GitPanel {
     }
 
     pub fn stash_pop(&mut self, _: &StashPop, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
+        let Some(action_repository) = self.action_repository(cx) else {
             return;
         };
 
         cx.spawn({
             async move |this, cx| {
-                let stash_task = active_repository
+                let stash_task = action_repository
                     .update(cx, |repo, cx| repo.stash_pop(None, cx))
                     .await;
                 this.update(cx, |this, cx| {
@@ -3099,13 +3113,13 @@ impl GitPanel {
     }
 
     pub fn stash_apply(&mut self, _: &StashApply, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
+        let Some(action_repository) = self.action_repository(cx) else {
             return;
         };
 
         cx.spawn({
             async move |this, cx| {
-                let stash_task = active_repository
+                let stash_task = action_repository
                     .update(cx, |repo, cx| repo.stash_apply(None, cx))
                     .await;
                 this.update(cx, |this, cx| {
@@ -3122,13 +3136,13 @@ impl GitPanel {
     }
 
     pub fn stash_all(&mut self, _: &StashAll, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
+        let Some(action_repository) = self.action_repository(cx) else {
             return;
         };
 
         cx.spawn({
             async move |this, cx| {
-                let stash_task = active_repository
+                let stash_task = action_repository
                     .update(cx, |repo, cx| repo.stash_all(cx))
                     .await;
                 this.update(cx, |this, cx| {
@@ -3329,6 +3343,7 @@ impl GitPanel {
 
     fn custom_or_suggested_commit_message(
         &self,
+        action_repository: &Entity<Repository>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
@@ -3338,8 +3353,9 @@ impl GitPanel {
             .language_at(MultiBufferOffset(0), cx);
         let message = self.commit_editor.read(cx).text(cx);
         if message.is_empty() {
-            return self
-                .suggest_commit_message(cx)
+            return (self.active_repository_id == Some(action_repository.read(cx).id))
+                .then(|| self.suggest_commit_message(cx))
+                .flatten()
                 .filter(|message| !message.trim().is_empty());
         } else if message.trim().is_empty() {
             return None;
@@ -3373,8 +3389,11 @@ impl GitPanel {
         if !text.trim().is_empty() {
             true
         } else if text.is_empty() {
-            self.suggest_commit_message(cx)
-                .is_some_and(|text| !text.trim().is_empty())
+            self.action_repository(cx)
+                .is_some_and(|repository| self.active_repository_id == Some(repository.read(cx).id))
+                && self
+                    .suggest_commit_message(cx)
+                    .is_some_and(|text| !text.trim().is_empty())
         } else {
             false
         }
@@ -3395,9 +3414,10 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(active_repository) = self.active_repository.clone() else {
+        let Some(action_repository) = self.action_repository(cx) else {
             return;
         };
+        let action_repository_id = action_repository.read(cx).id;
         let error_spawn = |message, window: &mut Window, cx: &mut App| {
             let prompt = window.prompt(PromptLevel::Warning, message, None, &["OK"], cx);
             cx.spawn(async move |_| {
@@ -3406,7 +3426,7 @@ impl GitPanel {
             .detach();
         };
 
-        if self.has_unstaged_conflicts() {
+        if self.has_unstaged_conflicts_for_repository(action_repository_id) {
             error_spawn(
                 "There are still conflicts. You must stage these before committing",
                 window,
@@ -3416,7 +3436,7 @@ impl GitPanel {
         }
 
         let askpass = self.askpass_delegate("git commit", window, cx);
-        let commit_message = self.custom_or_suggested_commit_message(window, cx);
+        let commit_message = self.custom_or_suggested_commit_message(&action_repository, window, cx);
 
         let Some(mut message) = commit_message else {
             self.commit_editor
@@ -3430,15 +3450,15 @@ impl GitPanel {
             self.fill_co_authors(&mut message, cx);
         }
 
-        let task = if self.has_staged_changes() {
+        let task = if self.has_staged_changes_for_repository(action_repository_id) {
             // Repository serializes all git operations, so we can just send a commit immediately
-            let commit_task = active_repository.update(cx, |repo, cx| {
+            let commit_task = action_repository.update(cx, |repo, cx| {
                 repo.commit(message.into(), None, options, askpass, cx)
             });
             cx.background_spawn(async move { commit_task.await? })
         } else {
             let changed_files = self
-                .change_entries_by_path()
+                .change_entries_for_repository(action_repository_id)
                 .filter(|status_entry| !status_entry.status.is_created())
                 .map(|status_entry| status_entry.repo_path.clone())
                 .collect::<Vec<_>>();
@@ -3449,10 +3469,10 @@ impl GitPanel {
             }
 
             let stage_task =
-                active_repository.update(cx, |repo, cx| repo.stage_entries(changed_files, cx));
+                action_repository.update(cx, |repo, cx| repo.stage_entries(changed_files, cx));
             cx.spawn(async move |_, cx| {
                 stage_task.await?;
-                let commit_task = active_repository.update(cx, |repo, cx| {
+                let commit_task = action_repository.update(cx, |repo, cx| {
                     repo.commit(message.into(), None, options, askpass, cx)
                 });
                 commit_task.await?
@@ -5915,6 +5935,21 @@ impl GitPanel {
             .any(|entry| entry.status.is_conflicted() && entry.staging.has_unstaged())
     }
 
+    fn has_staged_changes_for_repository(&self, repository_id: RepositoryId) -> bool {
+        self.change_entries_for_repository(repository_id)
+            .any(|entry| entry.staging.has_staged())
+    }
+
+    fn has_tracked_changes_for_repository(&self, repository_id: RepositoryId) -> bool {
+        self.change_entries_for_repository(repository_id)
+            .any(|entry| !entry.status.is_created())
+    }
+
+    fn has_unstaged_conflicts_for_repository(&self, repository_id: RepositoryId) -> bool {
+        self.change_entries_for_repository(repository_id)
+            .any(|entry| entry.status.is_conflicted() && entry.staging.has_unstaged())
+    }
+
     fn show_error_toast(&self, action: impl Into<SharedString>, e: anyhow::Error, cx: &mut App) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -6379,11 +6414,19 @@ impl GitPanel {
     }
 
     pub fn configure_commit_button(&self, cx: &mut Context<Self>) -> (bool, &'static str) {
+        let action_repository_id = self.action_repository(cx).map(|repository| repository.read(cx).id);
+        let has_unstaged_conflicts = action_repository_id
+            .is_some_and(|repository_id| self.has_unstaged_conflicts_for_repository(repository_id));
+        let has_staged_changes = action_repository_id
+            .is_some_and(|repository_id| self.has_staged_changes_for_repository(repository_id));
+        let has_tracked_changes = action_repository_id
+            .is_some_and(|repository_id| self.has_tracked_changes_for_repository(repository_id));
+
         if self.generate_commit_message_task.is_some() {
             (false, "Generating commit message...")
-        } else if self.has_unstaged_conflicts() {
+        } else if has_unstaged_conflicts {
             (false, "You must resolve conflicts before committing")
-        } else if !self.has_staged_changes() && !self.has_tracked_changes() && !self.amend_pending {
+        } else if !has_staged_changes && !has_tracked_changes && !self.amend_pending {
             (false, "No changes to commit")
         } else if self.pending_commit.is_some() {
             (false, "Commit in progress")
@@ -6392,20 +6435,31 @@ impl GitPanel {
         } else if !self.has_write_access(cx) {
             (false, "You do not have write access to this project")
         } else {
-            (true, self.commit_button_title())
+            (true, self.commit_button_title(cx))
         }
     }
 
-    pub fn commit_button_title(&self) -> &'static str {
+    pub fn commit_button_title(&self, cx: &App) -> &'static str {
+        let (has_staged_changes, has_tracked_changes) = self
+            .action_repository(cx)
+            .map(|repository| {
+                let repository_id = repository.read(cx).id;
+                (
+                    self.has_staged_changes_for_repository(repository_id),
+                    self.has_tracked_changes_for_repository(repository_id),
+                )
+            })
+            .unwrap_or_default();
+
         if self.amend_pending {
-            if self.has_staged_changes() {
+            if has_staged_changes {
                 "Amend"
-            } else if self.has_tracked_changes() {
+            } else if has_tracked_changes {
                 "Amend Tracked"
             } else {
                 "Amend"
             }
-        } else if self.has_staged_changes() {
+        } else if has_staged_changes {
             "Commit"
         } else {
             "Commit Tracked"
@@ -6837,7 +6891,7 @@ impl GitPanel {
 
     fn render_commit_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (can_commit, tooltip) = self.configure_commit_button(cx);
-        let title = self.commit_button_title();
+        let title = self.commit_button_title(cx);
         let commit_tooltip_focus_handle = self.commit_editor.focus_handle(cx);
         let options = self.commit_options();
         let amend = options.amend;
@@ -13149,9 +13203,25 @@ mod tests {
         });
         panel.update_in(&mut cx, |panel, _window, cx| {
             panel.selected_entry = Some(repository_b_header_index);
+            panel.change_all_files_stage(true, cx);
             cx.notify();
         });
         cx.run_until_parked();
+        let a_after_selected_stage = fs
+            .with_git_state(Path::new(path!("/root/project-a/.git")), false, |state| {
+                state.index_contents.get(&path) != state.head_contents.get(&path)
+            })
+            .unwrap();
+        let b_after_selected_stage = fs
+            .with_git_state(Path::new(path!("/root/project-b/.git")), false, |state| {
+                state.index_contents.get(&path) != state.head_contents.get(&path)
+            })
+            .unwrap();
+        assert!(
+            !a_after_selected_stage,
+            "stage all must not redirect a selected repository B action to active repository A"
+        );
+        assert!(b_after_selected_stage);
         cx.simulate_keystrokes("enter");
         cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
         cx.run_until_parked();
@@ -13173,6 +13243,49 @@ mod tests {
                     if header.repository_id == repository_b_id
             ));
         });
+
+        // Keep A active while the selected B header names the action target.
+        // The commit must not stage or commit A's identical relative path.
+        repository_a.update(&mut cx, |repository, cx| {
+            repository.set_as_active_repository(cx)
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        cx.run_until_parked();
+        let repository_b_header_index = panel.read_with(&cx, |panel, _| {
+            panel
+                .entries
+                .iter()
+                .position(|entry| {
+                    matches!(
+                        entry,
+                        GitListEntry::RepositoryHeader(header)
+                            if header.repository_id == repository_b_id
+                    )
+                })
+                .unwrap()
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_entry = Some(repository_b_header_index);
+            panel
+                .commit_message_buffer(cx)
+                .update(cx, |buffer, cx| buffer.set_text("Commit repository B", cx));
+            let focus_handle = panel.commit_editor.focus_handle(cx);
+            focus_handle.focus(window, cx);
+            assert!(panel.commit(&focus_handle, window, cx));
+        });
+        cx.run_until_parked();
+        let a_commit_count = fs
+            .with_git_state(Path::new(path!("/root/project-a/.git")), false, |state| {
+                state.commit_history.len()
+            })
+            .unwrap();
+        let b_commit_count = fs
+            .with_git_state(Path::new(path!("/root/project-b/.git")), false, |state| {
+                state.commit_history.len()
+            })
+            .unwrap();
+        assert_eq!(a_commit_count, 0, "commit must not redirect to active repository A");
+        assert_eq!(b_commit_count, 1);
     }
 
     #[gpui::test]
