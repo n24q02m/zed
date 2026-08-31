@@ -23,24 +23,44 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       RELEASE_VERSION: "0.0.0"
-      TARGET_COMMIT: ${{ inputs.commit || github.event.head_commit.message }}
-      ZED_WORKSPACE: ${{ github.workspace }}
     steps:
+      - name: Check out immutable verifier trigger
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          clean: false
+
+      - name: Resolve requested fork commit
+        id: target
+        shell: pwsh
+        env:
+          DISPATCH_COMMIT: ${{ inputs.commit }}
+        run: |
+          $expected = $env:DISPATCH_COMMIT.Trim()
+          if ([string]::IsNullOrWhiteSpace($expected)) {
+            $expected = (git log -1 --format=%s).Trim()
+          }
+          $expected = $expected.ToLowerInvariant()
+          if ($expected -notmatch "^[0-9a-f]{40}$") {
+            throw "commit must be a 40-character SHA; push verifier commits must use the target SHA as their subject"
+          }
+          "sha=$expected" >> $env:GITHUB_OUTPUT
+
       - name: Check out requested fork commit
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          ref: ${{ env.TARGET_COMMIT }}
+          ref: ${{ steps.target.outputs.sha }}
+          path: source
           fetch-depth: 1
           clean: false
 
       - name: Verify immutable source identity
         id: source
         shell: pwsh
+        working-directory: source
         run: |
-          $expected = "${{ env.TARGET_COMMIT }}".Trim().ToLowerInvariant()
-          if ($expected -notmatch "^[0-9a-f]{40}$") {
-            throw "commit must be a 40-character lowercase or uppercase SHA"
-          }
+          $expected = "${{ steps.target.outputs.sha }}"
           $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
           if ($actual -ne $expected) {
             throw "checked out $actual, expected $expected"
@@ -49,12 +69,15 @@ jobs:
 
       - name: Bundle unsigned Windows application
         shell: pwsh
+        working-directory: source
+        env:
+          ZED_WORKSPACE: ${{ github.workspace }}/source
         run: script/bundle-windows.ps1 -Architecture x86_64
 
       - name: Record binary provenance
         shell: pwsh
         run: |
-          $binary = Join-Path $env:GITHUB_WORKSPACE "inno/x86_64/Zed.exe"
+          $binary = Join-Path $env:GITHUB_WORKSPACE "source/inno/x86_64/Zed.exe"
           if (-not (Test-Path $binary)) {
             throw "expected bundle executable was not produced: $binary"
           }
@@ -69,7 +92,7 @@ jobs:
         with:
           name: zed-windows-ui-${{ steps.source.outputs.sha }}
           path: |
-            inno/x86_64
+            source/inno/x86_64
             ${{ runner.temp }}/fork-windows-ui-smoke.json
           if-no-files-found: error
           retention-days: 1
