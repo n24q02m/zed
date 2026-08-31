@@ -72,7 +72,37 @@ jobs:
         working-directory: source
         env:
           ZED_WORKSPACE: ${{ github.workspace }}/source
-        run: script/bundle-windows.ps1 -Architecture x86_64
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "GitHub-hosted Visual Studio discovery tool was not found: $vswhere"
+          }
+          $vsInstall = (& $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath | Select-Object -First 1 | Out-String).Trim()
+          $vsDevShell = Join-Path $vsInstall "Common7\Tools\Launch-VsDevShell.ps1"
+          if ([string]::IsNullOrWhiteSpace($vsInstall) -or -not (Test-Path $vsDevShell)) {
+            throw "GitHub-hosted Visual Studio developer shell was not found"
+          }
+          $sourceScript = Get-Content "script/bundle-windows.ps1" -Raw
+          $hardcodedDevShell = '& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1"'
+          $patchedDevShell = '& "' + $vsDevShell + '"'
+          $patchedScript = $sourceScript.Replace($hardcodedDevShell, $patchedDevShell)
+          if ($patchedScript -eq $sourceScript) {
+            throw "could not replace the candidate bundle script's fixed Visual Studio path"
+          }
+          $bundleScript = Join-Path (Get-Location) "script/.fork-ui-smoke-bundle-windows.ps1"
+          try {
+            Set-Content -Path $bundleScript -Value $patchedScript -Encoding utf8
+            & $bundleScript -Architecture x86_64
+          }
+          finally {
+            if (Test-Path $bundleScript) {
+              Remove-Item -Force $bundleScript
+            }
+          }
+          $dirty = git status --porcelain
+          if ($dirty) {
+            throw "candidate source worktree changed during bundling: $dirty"
+          }
 
       - name: Record binary provenance
         shell: pwsh
