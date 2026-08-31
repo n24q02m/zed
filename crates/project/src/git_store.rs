@@ -8139,36 +8139,76 @@ impl Repository {
         message: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
+        if entries.is_empty() {
+            return Task::ready(Ok(()));
+        }
+        if entries.iter().any(|entry| entry.is_empty()) {
+            return Task::ready(Err(anyhow::anyhow!(
+                "cannot stash an empty or invalid selected path"
+            )));
+        }
         let id = self.id;
-
-        cx.spawn(async move |this, cx| {
-            this.update(cx, |this, _| {
-                this.send_job("stash_entries", None, move |git_repo, _cx| async move {
-                    match git_repo {
-                        RepositoryState::Local(LocalRepositoryState {
-                            backend,
-                            environment,
-                            ..
-                        }) => backend.stash_paths(entries, message, environment).await,
-                        RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
-                            client
-                                .request(proto::Stash {
-                                    project_id: project_id.0,
-                                    repository_id: id.to_proto(),
-                                    paths: entries
-                                        .into_iter()
-                                        .map(|repo_path| repo_path.as_unix_str().to_owned())
-                                        .collect(),
-                                    message,
-                                    staged: None,
-                                })
-                                .await?;
-                            Ok(())
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        let this = cx.weak_entity();
+        cx.spawn(async move |this_task, cx| {
+            this_task
+                .update(cx, |this_repo, _| {
+                    this_repo.send_job("stash_entries", None, move |git_repo, mut cx| async move {
+                        match git_repo {
+                            RepositoryState::Local(LocalRepositoryState {
+                                backend,
+                                environment,
+                                ..
+                            }) => {
+                                let result =
+                                    backend.stash_paths(entries, message, environment).await;
+                                if result.is_ok()
+                                    && let Ok(stash_entries) = backend.stash_entries().await
+                                {
+                                    let snapshot = this.update(&mut cx, |this, cx| {
+                                        this.snapshot.stash_entries = stash_entries;
+                                        cx.emit(RepositoryEvent::StashEntriesChanged);
+                                        this.snapshot.clone()
+                                    })?;
+                                    if let Some(updates_tx) = updates_tx {
+                                        updates_tx
+                                            .unbounded_send(DownstreamUpdate::UpdateRepository(
+                                                snapshot,
+                                            ))
+                                            .ok();
+                                    }
+                                }
+                                result
+                            }
+                            RepositoryState::Remote(RemoteRepositoryState {
+                                project_id,
+                                client,
+                            }) => {
+                                client
+                                    .request(proto::Stash {
+                                        project_id: project_id.0,
+                                        repository_id: id.to_proto(),
+                                        paths: entries
+                                            .into_iter()
+                                            .map(|repo_path| repo_path.as_unix_str().to_owned())
+                                            .collect(),
+                                        message,
+                                        staged: None,
+                                    })
+                                    .await?;
+                                Ok(())
+                            }
                         }
-                    }
-                })
-            })?
-            .await??;
+                    })
+                })?
+                .await??;
             Ok(())
         })
     }
