@@ -66,7 +66,15 @@ jobs:
           if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
             throw "MSVC compiler was unavailable after entering the Visual Studio developer shell"
           }
-          cargo test -p git_ui test_show_all_repositories_preserves_repository_identity_when_staging --lib -- --exact
+          $testLog = Join-Path $env:RUNNER_TEMP "fork-git-ui-targeted-test.log"
+          & cargo test -p git_ui tests::test_show_all_repositories_preserves_repository_identity_when_staging --lib -- --exact 2>&1 | Tee-Object -FilePath $testLog
+          if ($LASTEXITCODE -ne 0) {
+            throw "focused Git UI test failed with cargo exit code $LASTEXITCODE"
+          }
+          $testOutput = Get-Content -Raw $testLog
+          if ($testOutput -notmatch "test result: ok\. 1 passed; 0 failed;") {
+            throw "focused Git UI test did not report exactly one passing test: $testOutput"
+          }
           cargo fmt --all -- --check
           $dirty = git status --porcelain
           if ($dirty) {
