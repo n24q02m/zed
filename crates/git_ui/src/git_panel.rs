@@ -3443,7 +3443,8 @@ impl GitPanel {
         }
 
         let askpass = self.askpass_delegate("git commit", window, cx);
-        let commit_message = self.custom_or_suggested_commit_message(&action_repository, window, cx);
+        let commit_message =
+            self.custom_or_suggested_commit_message(&action_repository, window, cx);
 
         let Some(mut message) = commit_message else {
             self.commit_editor
@@ -6422,7 +6423,9 @@ impl GitPanel {
     }
 
     pub fn configure_commit_button(&self, cx: &mut Context<Self>) -> (bool, &'static str) {
-        let action_repository_id = self.action_repository(cx).map(|repository| repository.read(cx).id);
+        let action_repository_id = self
+            .action_repository(cx)
+            .map(|repository| repository.read(cx).id);
         let has_unstaged_conflicts = action_repository_id
             .is_some_and(|repository_id| self.has_unstaged_conflicts_for_repository(repository_id));
         let has_staged_changes = action_repository_id
@@ -13276,9 +13279,9 @@ mod tests {
         });
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.selected_entry = Some(repository_b_header_index);
-            panel
-                .commit_message_buffer(cx)
-                .update(cx, |buffer, cx| buffer.set_text("Draft for repository A", cx));
+            panel.commit_message_buffer(cx).update(cx, |buffer, cx| {
+                buffer.set_text("Draft for repository A", cx)
+            });
             let focus_handle = panel.commit_editor.focus_handle(cx);
             focus_handle.focus(window, cx);
             assert!(
@@ -13333,7 +13336,10 @@ mod tests {
                 state.commit_history.len()
             })
             .unwrap();
-        assert_eq!(a_commit_count, 0, "commit must not redirect to active repository A");
+        assert_eq!(
+            a_commit_count, 0,
+            "commit must not redirect to active repository A"
+        );
         assert_eq!(b_commit_count, 1);
     }
 
