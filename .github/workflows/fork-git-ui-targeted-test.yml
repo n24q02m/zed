@@ -82,6 +82,9 @@ jobs:
             throw "focused Git UI test did not report exactly one passing test: $testOutput"
           }
           cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo fmt --check failed"
+          }
           $dirty = git status --porcelain
           if ($dirty) {
             throw "candidate source worktree changed during verification: $dirty"
