@@ -1,0 +1,74 @@
+# Fork-only verifier: compile and run one supplied immutable Git UI test target.
+name: fork-git-ui-targeted-test
+
+on:
+  push:
+    branches:
+      - verify/windows-ui-smoke
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test exact fork head Git UI routing
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out immutable verifier trigger
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          clean: false
+
+      - name: Resolve requested fork commit
+        id: target
+        shell: pwsh
+        run: |
+          $expected = (git log -1 --format=%s).Trim().ToLowerInvariant()
+          if ($expected -notmatch "^[0-9a-f]{40}$") {
+            throw "push verifier commits must use the target SHA as their subject"
+          }
+          "sha=$expected" >> $env:GITHUB_OUTPUT
+
+      - name: Check out requested fork commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          path: source
+          fetch-depth: 1
+          clean: false
+
+      - name: Verify immutable source identity
+        shell: pwsh
+        working-directory: source
+        run: |
+          $expected = "${{ steps.target.outputs.sha }}"
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "checked out $actual, expected $expected"
+          }
+
+      - name: Run focused Git UI routing test
+        shell: pwsh
+        working-directory: source
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = (& $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath | Select-Object -First 1 | Out-String).Trim()
+          $vsDevShell = Join-Path $vsInstall "Common7\Tools\Launch-VsDevShell.ps1"
+          if ([string]::IsNullOrWhiteSpace($vsInstall) -or -not (Test-Path $vsDevShell)) {
+            throw "GitHub-hosted Visual Studio developer shell was not found"
+          }
+          & $vsDevShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+            throw "MSVC compiler was unavailable after entering the Visual Studio developer shell"
+          }
+          cargo test -p git_ui test_show_all_repositories_preserves_repository_identity_when_staging --lib -- --exact
+          cargo fmt --all -- --check
+          $dirty = git status --porcelain
+          if ($dirty) {
+            throw "candidate source worktree changed during verification: $dirty"
+          }
