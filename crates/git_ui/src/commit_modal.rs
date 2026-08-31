@@ -456,12 +456,14 @@ impl CommitModal {
                             .disabled(!can_commit)
                             .child(Label::new(commit_label).size(LabelSize::Small).mr_0p5())
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                telemetry::event!("Git Committed", source = "Git Modal");
-                                this.git_panel.update(cx, |git_panel, cx| {
+                                let committed = this.git_panel.update(cx, |git_panel, cx| {
                                     let options = git_panel.commit_options();
                                     git_panel.commit_changes(options, window, cx)
                                 });
-                                cx.emit(DismissEvent);
+                                if committed {
+                                    telemetry::event!("Git Committed", source = "Git Modal");
+                                    cx.emit(DismissEvent);
+                                }
                             }))
                             .tooltip({
                                 let focus_handle = focus_handle.clone();

@@ -3274,8 +3274,7 @@ impl GitPanel {
     ) -> bool {
         if commit_editor_focus_handle.contains_focused(window, cx) {
             let options = self.commit_options();
-            self.commit_changes(options, window, cx);
-            true
+            self.commit_changes(options, window, cx)
         } else {
             cx.propagate();
             false
@@ -3413,9 +3412,9 @@ impl GitPanel {
         options: CommitOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(action_repository) = self.action_repository(cx) else {
-            return;
+            return false;
         };
         let action_repository_id = action_repository.read(cx).id;
         if self.active_repository_id != Some(action_repository_id) {
@@ -3424,7 +3423,7 @@ impl GitPanel {
             // editor so a selected repository action cannot consume another
             // repository's draft.
             self.activate_repository(action_repository_id, cx);
-            return;
+            return false;
         }
         let error_spawn = |message, window: &mut Window, cx: &mut App| {
             let prompt = window.prompt(PromptLevel::Warning, message, None, &["OK"], cx);
@@ -3440,7 +3439,7 @@ impl GitPanel {
                 window,
                 cx,
             );
-            return;
+            return false;
         }
 
         let askpass = self.askpass_delegate("git commit", window, cx);
@@ -3451,7 +3450,7 @@ impl GitPanel {
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window, cx);
-            return;
+            return false;
         };
 
         if self.add_coauthors {
@@ -3473,7 +3472,7 @@ impl GitPanel {
 
             if changed_files.is_empty() && !options.amend {
                 error_spawn("No changes to commit", window, cx);
-                return;
+                return false;
             }
 
             let stage_task =
@@ -3510,6 +3509,7 @@ impl GitPanel {
         });
 
         self.pending_commit = Some(task);
+        true
     }
 
     pub(crate) fn uncommit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6937,7 +6937,7 @@ impl GitPanel {
                             git_panel
                                 .update(cx, |git_panel, cx| {
                                     let options = git_panel.commit_options();
-                                    git_panel.commit_changes(options, window, cx);
+                                    let _ = git_panel.commit_changes(options, window, cx);
                                 })
                                 .ok();
                         }
@@ -13280,7 +13280,10 @@ mod tests {
                 .update(cx, |buffer, cx| buffer.set_text("Draft for repository A", cx));
             let focus_handle = panel.commit_editor.focus_handle(cx);
             focus_handle.focus(window, cx);
-            assert!(panel.commit(&focus_handle, window, cx));
+            assert!(
+                !panel.commit(&focus_handle, window, cx),
+                "switching the selected commit target must not emit a commit telemetry event"
+            );
         });
         cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
         cx.run_until_parked();
