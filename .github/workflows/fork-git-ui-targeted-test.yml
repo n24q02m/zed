@@ -17,6 +17,7 @@ jobs:
     env:
       CARGO_HOME: C:/c
       CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
     steps:
       - name: Check out immutable verifier trigger
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
