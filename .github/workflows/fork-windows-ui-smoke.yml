@@ -1,0 +1,71 @@
+# Fork-only verifier: build a supplied immutable fork commit for native UI evidence.
+name: fork-windows-ui-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact 40-character fork commit SHA to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: Bundle exact fork head for UI smoke evidence
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+      RELEASE_VERSION: "0.0.0"
+      ZED_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Check out requested fork commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 1
+          clean: false
+
+      - name: Verify immutable source identity
+        id: source
+        shell: pwsh
+        run: |
+          $expected = "${{ inputs.commit }}".Trim().ToLowerInvariant()
+          if ($expected -notmatch "^[0-9a-f]{40}$") {
+            throw "commit must be a 40-character lowercase or uppercase SHA"
+          }
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "checked out $actual, expected $expected"
+          }
+          "sha=$actual" >> $env:GITHUB_OUTPUT
+
+      - name: Bundle unsigned Windows application
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture x86_64
+
+      - name: Record binary provenance
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:GITHUB_WORKSPACE "inno/x86_64/Zed.exe"
+          if (-not (Test-Path $binary)) {
+            throw "expected bundle executable was not produced: $binary"
+          }
+          $metadata = [ordered]@{
+            source_sha = "${{ steps.source.outputs.sha }}"
+            binary_sha256 = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
+          } | ConvertTo-Json
+          $metadata | Set-Content -NoNewline -Encoding utf8 "$env:RUNNER_TEMP/fork-windows-ui-smoke.json"
+
+      - name: Upload runnable UI bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: zed-windows-ui-${{ steps.source.outputs.sha }}
+          path: |
+            inno/x86_64
+            ${{ runner.temp }}/fork-windows-ui-smoke.json
+          if-no-files-found: error
+          retention-days: 1
