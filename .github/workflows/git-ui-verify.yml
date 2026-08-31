@@ -1,0 +1,55 @@
+# Targeted Git verification workflow
+# Runs Git panel tests and clippy on GitHub-hosted Linux runners.
+name: git-ui-verify
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CC: clang
+  CXX: clang++
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Linux dependencies
+        run: ./script/linux
+
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Build Git and Git UI crates
+        run: cargo build -p git -p git_ui --quiet
+
+      - name: Run Git tests
+        run: cargo test -p git --lib --quiet
+
+      - name: Run Git UI tests
+        run: cargo test -p git_ui --lib --quiet
+
+      - name: Format check
+        run: cargo fmt --check -p git -p git_ui -p project
+
+  clippy-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - name: Install Linux dependencies
+        run: ./script/linux
+      - name: Clippy (repo script)
+        run: ./script/clippy
