@@ -1,0 +1,86 @@
+# Fork-only diagnostic: time the exact first release build used by bundle-windows.ps1.
+name: fork-windows-zed-build-diagnostic
+
+on:
+  push:
+    branches:
+      - verify/windows-zed-build-diagnostic
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Time exact Zed release build
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CARGO_HOME: C:/c
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out immutable diagnostic trigger
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          clean: false
+
+      - name: Resolve requested fork commit
+        id: target
+        shell: pwsh
+        run: |
+          $expected = (git log -1 --format=%s).Trim().ToLowerInvariant()
+          if ($expected -notmatch "^[0-9a-f]{40}$") {
+            throw "diagnostic trigger commits must use the target SHA as their subject"
+          }
+          "sha=$expected" >> $env:GITHUB_OUTPUT
+
+      - name: Check out requested fork commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          path: source
+          fetch-depth: 1
+          clean: false
+
+      - name: Verify immutable source identity
+        shell: pwsh
+        working-directory: source
+        run: |
+          $expected = "${{ steps.target.outputs.sha }}"
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "checked out $actual, expected $expected"
+          }
+
+      - name: Time exact first bundle build
+        shell: pwsh
+        working-directory: source
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = (& $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath | Select-Object -First 1 | Out-String).Trim()
+          $vsDevShell = Join-Path $vsInstall "Common7\Tools\Launch-VsDevShell.ps1"
+          if ([string]::IsNullOrWhiteSpace($vsInstall) -or -not (Test-Path $vsDevShell)) {
+            throw "GitHub-hosted Visual Studio developer shell was not found"
+          }
+          & $vsDevShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+            throw "MSVC compiler was unavailable after entering the Visual Studio developer shell"
+          }
+          New-Item -ItemType Directory -Force $env:CARGO_HOME | Out-Null
+          $started = Get-Date
+          Write-Host "DIAGNOSTIC_BUILD_START_UTC=$($started.ToUniversalTime().ToString('o'))"
+          & cargo --color never build --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc
+          $exitCode = $LASTEXITCODE
+          $finished = Get-Date
+          Write-Host "DIAGNOSTIC_BUILD_END_UTC=$($finished.ToUniversalTime().ToString('o'))"
+          Write-Host "DIAGNOSTIC_BUILD_ELAPSED_SECONDS=$([Math]::Round(($finished - $started).TotalSeconds, 3))"
+          if ($exitCode -ne 0) {
+            throw "exact first bundle build failed with cargo exit code $exitCode"
+          }
+          $zed = "target/x86_64-pc-windows-msvc/release/zed.exe"
+          if (-not (Test-Path $zed)) {
+            throw "exact first bundle build did not produce $zed"
+          }
+          Write-Host "DIAGNOSTIC_ZED_EXE=$zed"
