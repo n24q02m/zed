@@ -1,5 +1,5 @@
-# Fork-only diagnostic: time the exact first release build used by bundle-windows.ps1.
-name: fork-windows-zed-build-diagnostic
+# Fork-only verifier: build an exact debug Zed executable for native UI evidence.
+name: fork-windows-zed-ui-binary
 
 on:
   push:
@@ -11,15 +11,15 @@ permissions:
 
 jobs:
   build:
-    name: Time exact Zed release build
+    name: Build exact debug Zed UI binary
     runs-on: windows-2022
     timeout-minutes: 90
     env:
       CARGO_HOME: C:/c
-      CARGO_INCREMENTAL: "0"
+      CARGO_INCREMENTAL: "1"
       CARGO_TERM_COLOR: never
     steps:
-      - name: Check out immutable diagnostic trigger
+      - name: Check out immutable verifier trigger
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           ref: ${{ github.sha }}
@@ -32,7 +32,7 @@ jobs:
         run: |
           $expected = (git log -1 --format=%s).Trim().ToLowerInvariant()
           if ($expected -notmatch "^[0-9a-f]{40}$") {
-            throw "diagnostic trigger commits must use the target SHA as their subject"
+            throw "verifier trigger commits must use the target SHA as their subject"
           }
           "sha=$expected" >> $env:GITHUB_OUTPUT
 
@@ -45,6 +45,7 @@ jobs:
           clean: false
 
       - name: Verify immutable source identity
+        id: source
         shell: pwsh
         working-directory: source
         run: |
@@ -53,8 +54,9 @@ jobs:
           if ($actual -ne $expected) {
             throw "checked out $actual, expected $expected"
           }
+          "sha=$actual" >> $env:GITHUB_OUTPUT
 
-      - name: Time exact first bundle build
+      - name: Build exact debug Zed executable
         shell: pwsh
         working-directory: source
         run: |
@@ -70,17 +72,39 @@ jobs:
           }
           New-Item -ItemType Directory -Force $env:CARGO_HOME | Out-Null
           $started = Get-Date
-          Write-Host "DIAGNOSTIC_BUILD_START_UTC=$($started.ToUniversalTime().ToString('o'))"
-          & cargo --color never build --release --package zed --package cli --package auto_update_helper --target x86_64-pc-windows-msvc
+          Write-Host "UI_BINARY_BUILD_START_UTC=$($started.ToUniversalTime().ToString('o'))"
+          & cargo --color never build --package zed --target x86_64-pc-windows-msvc
           $exitCode = $LASTEXITCODE
           $finished = Get-Date
-          Write-Host "DIAGNOSTIC_BUILD_END_UTC=$($finished.ToUniversalTime().ToString('o'))"
-          Write-Host "DIAGNOSTIC_BUILD_ELAPSED_SECONDS=$([Math]::Round(($finished - $started).TotalSeconds, 3))"
+          Write-Host "UI_BINARY_BUILD_END_UTC=$($finished.ToUniversalTime().ToString('o'))"
+          Write-Host "UI_BINARY_BUILD_ELAPSED_SECONDS=$([Math]::Round(($finished - $started).TotalSeconds, 3))"
           if ($exitCode -ne 0) {
-            throw "exact first bundle build failed with cargo exit code $exitCode"
+            throw "debug Zed UI binary build failed with cargo exit code $exitCode"
           }
-          $zed = "target/x86_64-pc-windows-msvc/release/zed.exe"
+          $zed = "target/x86_64-pc-windows-msvc/debug/zed.exe"
           if (-not (Test-Path $zed)) {
-            throw "exact first bundle build did not produce $zed"
+            throw "debug Zed UI binary build did not produce $zed"
           }
-          Write-Host "DIAGNOSTIC_ZED_EXE=$zed"
+
+      - name: Record binary provenance
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:GITHUB_WORKSPACE "source/target/x86_64-pc-windows-msvc/debug/zed.exe"
+          $metadata = [ordered]@{
+            source_sha = "${{ steps.source.outputs.sha }}"
+            cargo_profile = "dev"
+            cargo_command = "cargo --color never build --package zed --target x86_64-pc-windows-msvc"
+            binary_sha256 = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
+          } | ConvertTo-Json
+          $metadata | Set-Content -NoNewline -Encoding utf8 "$env:RUNNER_TEMP/fork-windows-ui-binary.json"
+
+      - name: Upload runnable UI binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: zed-windows-ui-dev-${{ steps.source.outputs.sha }}
+          path: |
+            source/target/x86_64-pc-windows-msvc/debug/zed.exe
+            source/target/x86_64-pc-windows-msvc/debug/*.dll
+            ${{ runner.temp }}/fork-windows-ui-binary.json
+          if-no-files-found: error
+          retention-days: 1
