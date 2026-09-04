@@ -12,8 +12,8 @@ use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
     repository::{
-        Branch, CommitDiff, CommitFile, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
-        SearchCommitArgs, UpstreamTrackingStatus,
+        Branch, InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs,
+        UpstreamTrackingStatus,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
 };

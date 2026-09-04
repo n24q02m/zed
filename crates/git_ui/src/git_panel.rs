@@ -1037,6 +1037,7 @@ impl GitListEntry {
             GitListEntry::TreeStatus(entry) => Some(&entry.entry.repo_path),
             GitListEntry::Directory(entry) => Some(&entry.key.path),
             GitListEntry::Header(_) | GitListEntry::EmptySection(_) => None,
+            GitListEntry::RepositoryHeader(_) | GitListEntry::ProjectRepositoriesHeader(_) => None,
         }
     }
 }
@@ -1072,6 +1073,10 @@ impl GitPanelViewMode {
 
 #[derive(Default)]
 struct TreeViewState {
+    // Maps visible index to actual entry index.
+    // Length equals the number of visible entries.
+    // This is needed because some entries (like collapsed directories) may be hidden.
+    logical_indices: Vec<usize>,
     expanded_dirs: HashMap<TreeKey, bool>,
     directory_descendants: HashMap<TreeKey, Vec<GitStatusEntry>>,
 }
@@ -1873,6 +1878,10 @@ impl GitPanel {
         self.selection_anchor = self.selected_entry_id.clone();
     }
 
+    fn get_selected_entry(&self) -> Option<&GitListEntry> {
+        self.selected_entry.and_then(|i| self.entries.get(i))
+    }
+
     fn select_entry_from_pointer(&mut self, index: usize, shift: bool, toggle: bool) {
         let Some(target) = self.entry_identity(index) else {
             return;
@@ -2230,7 +2239,7 @@ impl GitPanel {
                     return;
                 };
                 if self
-                    .collapsed_sections
+                    .collapsed_sections_by_repository
                     .contains(&(repository_id, entry.header))
                 {
                     self.toggle_section(repository_id, entry.header, window, cx);
@@ -2249,13 +2258,22 @@ impl GitPanel {
     }
 
     /// Finds the nearest expanded directory at or above the given path.
-    fn nearest_expanded_directory_key(&self, section: Section, path: &RepoPath) -> Option<TreeKey> {
+    fn nearest_expanded_directory_key(
+        &self,
+        repository_id: RepositoryId,
+        section: Section,
+        path: &RepoPath,
+    ) -> Option<TreeKey> {
         let tree_state = self.view_mode.tree_state()?;
         let mut candidate_path = Some(path.clone());
 
         while let Some(path) = candidate_path {
             candidate_path = path.parent().map(RepoPath::from_rel_path);
-            let key = TreeKey { section, path };
+            let key = TreeKey {
+                repository_id,
+                section,
+                path,
+            };
 
             if tree_state.expanded_dirs.get(&key).copied() == Some(true) {
                 return Some(key);
@@ -2318,13 +2336,22 @@ impl GitPanel {
         }
 
         let directory_key = match self.entries.get(selected_index) {
-            Some(GitListEntry::Directory(directory)) => {
-                self.nearest_expanded_directory_key(directory.key.section, &directory.key.path)
-            }
+            Some(GitListEntry::Directory(directory)) => self.nearest_expanded_directory_key(
+                directory.key.repository_id,
+                directory.key.section,
+                &directory.key.path,
+            ),
             Some(GitListEntry::TreeStatus(status)) => self
-                .section_for_entry_index(selected_index)
-                .and_then(|section| {
-                    self.nearest_expanded_directory_key(section, &status.entry.repo_path)
+                .repository_id_for_entry_index(selected_index)
+                .and_then(|repository_id| {
+                    self.section_for_entry_index(selected_index)
+                        .and_then(|section| {
+                            self.nearest_expanded_directory_key(
+                                repository_id,
+                                section,
+                                &status.entry.repo_path,
+                            )
+                        })
                 }),
             _ => None,
         };
@@ -6299,6 +6326,7 @@ impl GitPanel {
         }
 
         if let Some(mut state) = tree_state {
+            state.logical_indices = self.visible_entry_indices.clone();
             state
                 .expanded_dirs
                 .retain(|key, _| seen_directories.contains(key));
@@ -9967,6 +9995,7 @@ impl GitPanel {
                     ),
             )
             .on_click({
+                let key = entry.key.clone();
                 cx.listener(move |this, event: &ClickEvent, window, cx| {
                     let shift = event.modifiers().shift;
                     let toggle = event.modifiers().secondary();
@@ -13737,7 +13766,7 @@ mod tests {
             );
             assert!(
                 panel
-                    .collapsed_sections
+                    .collapsed_sections_by_repository
                     .contains(&(repository_b_id, Section::Tracked))
             );
             assert!(!panel.is_entry_visible(repository_b_entry_index));
@@ -13840,7 +13869,7 @@ mod tests {
         panel.read_with(&cx, |panel, _| {
             assert!(
                 panel
-                    .collapsed_sections
+                    .collapsed_sections_by_repository
                     .contains(&(repository_b_id, Section::Tracked))
             );
             assert!(!panel.is_entry_visible(repository_b_entry_index));
@@ -13858,7 +13887,7 @@ mod tests {
         panel.read_with(&cx, |panel, _| {
             assert!(
                 !panel
-                    .collapsed_sections
+                    .collapsed_sections_by_repository
                     .contains(&(repository_b_id, Section::Tracked))
             );
             assert!(panel.is_entry_visible(repository_b_entry_index));
@@ -14780,7 +14809,7 @@ mod tests {
             );
             assert!(
                 !panel
-                    .collapsed_sections
+                    .collapsed_sections_by_repository
                     .contains(&(submodule_repository_id, Section::Tracked))
             );
             let selected_ix = panel
@@ -16810,11 +16839,16 @@ mod tests {
 
         // Build the `TreeKey` for both the `files/` and `files/docs/` folders
         // so we can later assert that these entries are selected.
+        let repository_id = panel
+            .read_with(cx, |panel, _| panel.active_repository_id)
+            .expect("test repository should be active");
         let files_key = TreeKey {
+            repository_id,
             section: Section::Tracked,
             path: repo_path("files/"),
         };
         let docs_key = TreeKey {
+            repository_id,
             section: Section::Tracked,
             path: repo_path("files/docs/"),
         };
