@@ -83,6 +83,8 @@ actions!(
         UnstageAll,
         /// Stashes all changes in the repository, including untracked files.
         StashAll,
+        /// Stashes changes for the selected file or directory.
+        StashFile,
         /// Stashes tracked changes in the repository, leaving untracked files in place.
         StashTracked,
         /// Stashes staged changes in the repository, leaving unstaged changes in place.

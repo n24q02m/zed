@@ -516,6 +516,13 @@ impl sum_tree::KeyedItem for StatusEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositoryId(pub u64);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub is_dirty: bool,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MergeDetails {
     pub merge_heads_by_conflicted_path: TreeMap<RepoPath, Vec<Option<SharedString>>>,
@@ -2487,6 +2494,70 @@ impl GitStore {
             event.clone(),
             self.active_repo_id == Some(id),
         ))
+    }
+
+    /// Refreshes each parent gitlink in a chain of modern submodules.
+    ///
+    /// A nested repository's HEAD can change without producing a filesystem
+    /// event that is assigned to its parent: worktree events intentionally go
+    /// to the innermost repository. For submodules, that would leave the
+    /// parent's cached gitlink status stale after a branch switch.
+    fn refresh_submodule_ancestor_statuses(
+        &mut self,
+        changed_repository_id: RepositoryId,
+        cx: &mut Context<Self>,
+    ) {
+        let GitStoreState::Local { downstream, .. } = &self.state else {
+            return;
+        };
+        let updates_tx = downstream
+            .as_ref()
+            .map(|downstream| downstream.updates_tx.clone());
+        let Some(mut child_snapshot) = self
+            .repositories
+            .get(&changed_repository_id)
+            .map(|repository| repository.read(cx).snapshot.clone())
+        else {
+            return;
+        };
+        let mut visited: HashSet<RepositoryId> = HashSet::default();
+        visited.insert(changed_repository_id);
+        let mut ancestors = Vec::new();
+
+        loop {
+            let Some((parent_id, parent, parent_snapshot, repo_path, _)) = self
+                .repositories
+                .iter()
+                .filter(|(repository_id, _)| !visited.contains(repository_id))
+                .filter_map(|(repository_id, repository)| {
+                    let parent_snapshot = repository.read(cx).snapshot.clone();
+                    child_snapshot
+                        .modern_submodule_path_in(&parent_snapshot)
+                        .map(|repo_path| {
+                            (
+                                *repository_id,
+                                repository.clone(),
+                                parent_snapshot.clone(),
+                                repo_path,
+                                parent_snapshot.work_directory_abs_path.components().count(),
+                            )
+                        })
+                })
+                .max_by_key(|(_, _, _, _, depth)| *depth)
+            else {
+                break;
+            };
+
+            visited.insert(parent_id);
+            ancestors.push((parent, repo_path));
+            child_snapshot = parent_snapshot;
+        }
+
+        for (repository, repo_path) in ancestors {
+            repository.update(cx, |repository, cx| {
+                repository.paths_changed(vec![repo_path], updates_tx.clone(), cx);
+            });
+        }
     }
 
     fn on_jobs_updated(&mut self, _: Entity<Repository>, _: &JobsUpdated, cx: &mut Context<Self>) {
@@ -6232,6 +6303,28 @@ impl RepositorySnapshot {
         Self::abs_path_to_repo_path_inner(&self.work_directory_abs_path, abs_path, self.path_style)
     }
 
+    /// Returns this repository's path within `parent` when the repositories have
+    /// the layout used by a modern, absorbed Git submodule.
+    ///
+    /// This deliberately stays conservative: old-form submodules that keep a
+    /// real `.git` directory in their worktree are indistinguishable from an
+    /// ordinary nested repository without consulting the parent's index.
+    pub fn modern_submodule_path_in(&self, parent: &RepositorySnapshot) -> Option<RepoPath> {
+        let is_strictly_nested = self.work_directory_abs_path != parent.work_directory_abs_path
+            && self
+                .work_directory_abs_path
+                .starts_with(parent.work_directory_abs_path.as_ref());
+        let uses_absorbed_git_dir = self.repository_dir_abs_path == self.common_dir_abs_path
+            && self.dot_git_abs_path != self.repository_dir_abs_path
+            && self
+                .repository_dir_abs_path
+                .starts_with(parent.repository_dir_abs_path.join("modules"));
+
+        (is_strictly_nested && uses_absorbed_git_dir)
+            .then(|| parent.abs_path_to_repo_path(&self.work_directory_abs_path))
+            .flatten()
+    }
+
     pub fn repo_path_to_abs_path(&self, repo_path: &RepoPath) -> PathBuf {
         let repo_path = repo_path.display(self.path_style);
         PathBuf::from(
@@ -6359,6 +6452,46 @@ impl Repository {
 
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
+    }
+
+    pub fn worktree_status(
+        &self,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WorktreeStatus>> {
+        let repository_state = self.repository_state.clone();
+        cx.spawn(async move |_, _cx| {
+            let state = repository_state.await.map_err(|error| anyhow!(error))?;
+            let RepositoryState::Local(local_state) = state else {
+                bail!("worktree status is unavailable for remote repositories");
+            };
+
+            let system_git_binary_path = local_state
+                .environment
+                .get("PATH")
+                .and_then(|search_paths| {
+                    which::which_in("git", Some(search_paths), &worktree_path).ok()
+                })
+                .or_else(|| which::which("git").ok());
+            let backend = local_state.fs.open_repo(
+                &worktree_path.join(".git"),
+                system_git_binary_path.as_deref(),
+            )?;
+            let status = backend.status(&[]).await?;
+            let branch = backend
+                .branches()
+                .await?
+                .branches
+                .into_iter()
+                .find(|branch| branch.is_head);
+            let tracking = branch.and_then(|branch| branch.tracking_status());
+
+            Ok(WorktreeStatus {
+                is_dirty: !status.entries.is_empty(),
+                ahead: tracking.map(|tracking| tracking.ahead),
+                behind: tracking.map(|tracking| tracking.behind),
+            })
+        })
     }
 
     pub fn pending_ops(&self) -> impl Iterator<Item = PendingOps> + '_ {
@@ -8139,6 +8272,14 @@ impl Repository {
         message: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
+        if entries.is_empty() {
+            return Task::ready(Ok(()));
+        }
+        if entries.iter().any(|entry| entry.is_empty()) {
+            return Task::ready(Err(anyhow::anyhow!(
+                "cannot stash an empty or invalid selected path"
+            )));
+        }
         let id = self.id;
 
         cx.spawn(async move |this, cx| {
@@ -9614,6 +9755,7 @@ impl Repository {
         base_branch: Option<String>,
     ) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
+        let git_store = self.git_store.clone();
         let status_msg = if let Some(ref base) = base_branch {
             format!("git switch -c {branch_name} {base}").into()
         } else {
@@ -9622,10 +9764,18 @@ impl Repository {
         self.send_job(
             "create_branch",
             Some(status_msg),
-            move |repo, _cx| async move {
+            move |repo, mut cx| async move {
                 match repo {
                     RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                        backend.create_branch(branch_name, base_branch).await
+                        let result = backend.create_branch(branch_name, base_branch).await;
+                        if result.is_ok() {
+                            git_store
+                                .update(&mut cx, |git_store, cx| {
+                                    git_store.refresh_submodule_ancestor_statuses(id, cx);
+                                })
+                                .ok();
+                        }
+                        result
                     }
                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                         client
@@ -9646,13 +9796,22 @@ impl Repository {
 
     pub fn change_branch(&mut self, branch_name: String) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
+        let git_store = self.git_store.clone();
         self.send_job(
             "change_branch",
             Some(format!("git switch {branch_name}").into()),
-            move |repo, _cx| async move {
+            move |repo, mut cx| async move {
                 match repo {
                     RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                        backend.change_branch(branch_name).await
+                        let result = backend.change_branch(branch_name).await;
+                        if result.is_ok() {
+                            git_store
+                                .update(&mut cx, |git_store, cx| {
+                                    git_store.refresh_submodule_ancestor_statuses(id, cx);
+                                })
+                                .ok();
+                        }
+                        result
                     }
                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
                         client
@@ -10749,7 +10908,6 @@ pub fn repo_identity_path(common_dir: &Path, path_style: PathStyle) -> &Path {
         common_dir
     }
 }
-
 /// Returns the repository identity only when `std::path` can interpret the path correctly.
 ///
 /// Callers whose downstream path operations are not yet `PathStyle`-aware use this to preserve
@@ -11259,6 +11417,11 @@ impl Repository {
     pub fn set_branch_list_for_test(&mut self, branches: Vec<Branch>, cx: &mut Context<Self>) {
         self.snapshot.branch_list = branches.into();
         cx.emit(RepositoryEvent::BranchListChanged);
+    }
+
+    pub fn set_branch_for_test(&mut self, branch: Option<Branch>, cx: &mut Context<Self>) {
+        self.snapshot.branch = branch;
+        cx.emit(RepositoryEvent::HeadChanged);
     }
 
     pub fn loaded_commit_data_for_test(&self) -> HashMap<Oid, CommitData> {
