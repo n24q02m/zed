@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use fuzzy::StringMatchCandidate;
 use git::repository::Worktree as GitWorktree;
 use gpui::{
@@ -11,14 +11,16 @@ use gpui::{
     Render, SharedString, Styled, Subscription, Task, TaskExt, WeakEntity, Window, actions,
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
-use project::Project;
-use project::git_store::RepositoryEvent;
+use project::{
+    Project,
+    git_store::{RepositoryEvent, RepositoryId},
+    repo_identity_path_if_local,
+};
 use ui::{
     Button, CommonAnimationExt as _, Divider, HighlightedLabel, IconButton, KeyBinding, ListItem,
     ListItemSpacing, ListSubHeader, Tooltip, prelude::*,
 };
-use util::ResultExt as _;
-use util::paths::PathExt;
+use util::{ResultExt as _, paths::PathExt};
 use workspace::{
     ModalView, MultiWorkspace, RemovalIntent, Workspace, dock::DockPosition,
     notifications::DetachAndPromptErr,
@@ -45,6 +47,7 @@ pub struct WorktreePicker {
     picker: Entity<Picker<WorktreePickerDelegate>>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    _loading_task: Task<anyhow::Result<()>>,
 }
 
 impl WorktreePicker {
@@ -89,6 +92,12 @@ impl WorktreePicker {
 
         let has_multiple_repositories = project_ref.repositories(cx).len() > 1;
         let repository = project_ref.active_repository(cx);
+        let repository_identity_path = repository.as_ref().and_then(|repository| {
+            let repository = repository.read(cx);
+            repo_identity_path_if_local(&repository.common_dir_abs_path, repository.path_style)
+                .map(Path::to_path_buf)
+        });
+        let repository_id = repository.as_ref().map(|repository| repository.read(cx).id);
 
         let current_branch_name = repository.as_ref().and_then(|repo| {
             repo.read(cx)
@@ -108,8 +117,11 @@ impl WorktreePicker {
         let initial_matches = vec![WorktreeEntry::CreateFromCurrentBranch];
 
         let delegate = WorktreePickerDelegate {
+            worktree_statuses: HashMap::default(),
             matches: initial_matches,
             all_worktrees: Vec::new(),
+            repository_id,
+            repository_identity_path,
             project_worktree_paths,
             selected_index: 0,
             project,
@@ -124,6 +136,7 @@ impl WorktreePicker {
             active_worktree_paths,
             hovered_delete_index: None,
             deleting_worktree_paths: HashSet::default(),
+            refresh_task: None,
         };
 
         let picker = cx.new(|cx| {
@@ -139,8 +152,9 @@ impl WorktreePicker {
         });
 
         let mut subscriptions = Vec::new();
+        let status_repository = repository.clone();
 
-        {
+        let loading_task = {
             let picker_handle = picker.downgrade();
             cx.spawn_in(window, async move |_this, cx| {
                 let all_worktrees: Vec<_> = match all_worktrees_request {
@@ -159,6 +173,27 @@ impl WorktreePicker {
                     },
                     None => Vec::new(),
                 };
+                let mut loaded_statuses = HashMap::default();
+                if let Some(repository) = status_repository {
+                    for worktree in &all_worktrees {
+                        let path = worktree.path.clone();
+                        match repository
+                            .update(cx, |repository, cx| {
+                                repository.worktree_status(path.clone(), cx)
+                            })
+                            .await
+                        {
+                            Ok(status) => {
+                                loaded_statuses.insert(path, status);
+                            }
+                            Err(error) => {
+                                log::debug!(
+                                    "WorktreePicker: status load failed for {path:?}: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
 
                 let default_branch = match default_branch_request {
                     Some(req) => req.await.ok().and_then(Result::ok).flatten(),
@@ -169,14 +204,21 @@ impl WorktreePicker {
                     picker.delegate.all_worktrees = all_worktrees;
                     picker.delegate.default_branch =
                         default_branch.and_then(|branch| RemoteBranchName::parse(&branch));
+                    picker.delegate.refresh_worktree_statuses(cx);
+                    for (path, loaded_status) in loaded_statuses {
+                        if let Some(status) = picker.delegate.worktree_statuses.get_mut(&path) {
+                            status.is_dirty = Some(loaded_status.is_dirty);
+                            status.ahead = loaded_status.ahead;
+                            status.behind = loaded_status.behind;
+                        }
+                    }
                     picker.delegate.refresh_project_worktree_paths(window, cx);
                     picker.refresh(window, cx);
                 })?;
 
                 anyhow::Ok(())
             })
-            .detach_and_log_err(cx);
-        }
+        };
 
         if let Some(repo) = &repository {
             let picker_entity = picker.downgrade();
@@ -186,20 +228,64 @@ impl WorktreePicker {
                 move |_this, repo, event: &RepositoryEvent, window, cx| {
                     if matches!(event, RepositoryEvent::GitWorktreeListChanged) {
                         let worktrees_request = repo.update(cx, |repo, _| repo.worktrees());
+                        let status_repository = repo.clone();
                         let picker = picker_entity.clone();
-                        cx.spawn_in(window, async move |_, cx| {
+                        let refresh_task = cx.spawn_in(window, async move |_, cx| {
                             let all_worktrees: Vec<_> = worktrees_request
                                 .await??
                                 .into_iter()
                                 .filter(|wt| !wt.is_bare)
                                 .collect();
+                            let mut loaded_statuses = HashMap::default();
+                            for worktree in &all_worktrees {
+                                let path = worktree.path.clone();
+                                match status_repository
+                                    .update(cx, |repository, cx| {
+                                        repository.worktree_status(path.clone(), cx)
+                                    })
+                                    .await
+                                {
+                                    Ok(status) => {
+                                        loaded_statuses.insert(path, status);
+                                    }
+                                    Err(error) => {
+                                        log::debug!(
+                                            "WorktreePicker: status load failed for {path:?}: {error}"
+                                        );
+                                    }
+                                }
+                            }
                             picker.update_in(cx, |picker, window, cx| {
                                 picker.delegate.all_worktrees = all_worktrees;
+                                picker.delegate.refresh_worktree_statuses(cx);
+                                for (path, loaded_status) in loaded_statuses {
+                                    if let Some(status) = picker.delegate.worktree_statuses.get_mut(&path) {
+                                        status.is_dirty = Some(loaded_status.is_dirty);
+                                        status.ahead = loaded_status.ahead;
+                                        status.behind = loaded_status.behind;
+                                    }
+                                }
                                 picker.refresh(window, cx);
                             })?;
                             anyhow::Ok(())
-                        })
-                        .detach_and_log_err(cx);
+                        });
+                        picker_entity
+                            .update_in(cx, |picker, _window, _cx| {
+                                picker.delegate.refresh_task = Some(refresh_task);
+                            })
+                            .log_err();
+                    } else if matches!(
+                        event,
+                        RepositoryEvent::StatusesChanged
+                            | RepositoryEvent::BranchListChanged
+                            | RepositoryEvent::HeadChanged
+                    ) {
+                        picker_entity
+                            .update_in(cx, |picker, window, cx| {
+                                picker.delegate.refresh_worktree_statuses(cx);
+                                picker.refresh(window, cx);
+                            })
+                            .log_err();
                     }
                 },
             ));
@@ -213,6 +299,7 @@ impl WorktreePicker {
             focus_handle: picker.focus_handle(cx),
             picker,
             _subscriptions: subscriptions,
+            _loading_task: loading_task,
         }
     }
 
@@ -277,6 +364,7 @@ enum WorktreeEntry {
     SectionHeader(SharedString),
     Worktree {
         worktree: GitWorktree,
+        status: WorktreePickerStatus,
         positions: Vec<usize>,
     },
     CreateNamed {
@@ -286,9 +374,79 @@ enum WorktreeEntry {
     },
 }
 
+fn worktree_dirty_label(is_dirty: Option<bool>) -> &'static str {
+    match is_dirty {
+        Some(true) => "dirty",
+        Some(false) => "clean",
+        None => "unavailable",
+    }
+}
+
+fn worktree_tracking_label(
+    branch_name: Option<&str>,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+) -> String {
+    match (branch_name, ahead, behind) {
+        (None, _, _) => "not applicable".to_string(),
+        (Some(_), Some(ahead), Some(behind)) if ahead == 0 && behind == 0 => {
+            "up to date".to_string()
+        }
+        (Some(_), Some(ahead), Some(behind)) => format!("↑{ahead} ↓{behind}"),
+        (Some(_), _, _) => "unavailable".to_string(),
+    }
+}
+
+fn worktree_matches_repository(
+    worktree_path: &Path,
+    repository_worktree_path: Option<&Path>,
+    repository_identity_path: Option<&Path>,
+    picker_identity_path: Option<&Path>,
+) -> bool {
+    repository_worktree_path == Some(worktree_path)
+        || repository_identity_path.is_some() && repository_identity_path == picker_identity_path
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreePickerStatus {
+    repository_id: RepositoryId,
+    repository_identity_path: PathBuf,
+    is_dirty: Option<bool>,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreePickerRow {
+    worktree: GitWorktree,
+    status: WorktreePickerStatus,
+}
+
+fn build_worktree_picker_view_model(
+    worktrees: Vec<(GitWorktree, WorktreePickerStatus)>,
+) -> Vec<WorktreePickerRow> {
+    let mut rows = worktrees
+        .into_iter()
+        .map(|(worktree, status)| WorktreePickerRow { worktree, status })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.worktree
+            .directory_name(Some(&left.status.repository_identity_path))
+            .cmp(
+                &right
+                    .worktree
+                    .directory_name(Some(&right.status.repository_identity_path)),
+            )
+            .then_with(|| left.worktree.path.cmp(&right.worktree.path))
+    });
+    rows
+}
+
 struct WorktreePickerDelegate {
+    worktree_statuses: HashMap<PathBuf, WorktreePickerStatus>,
     matches: Vec<WorktreeEntry>,
     all_worktrees: Vec<GitWorktree>,
+    repository_id: Option<RepositoryId>,
+    repository_identity_path: Option<PathBuf>,
     project_worktree_paths: HashSet<PathBuf>,
     active_worktree_paths: HashSet<PathBuf>,
     selected_index: usize,
@@ -303,6 +461,18 @@ struct WorktreePickerDelegate {
     modifiers: Modifiers,
     hovered_delete_index: Option<usize>,
     deleting_worktree_paths: HashSet<PathBuf>,
+    refresh_task: Option<Task<anyhow::Result<()>>>,
+}
+
+fn worktree_name_anchor<'a>(
+    worktrees: &'a [GitWorktree],
+    repository_identity_path: Option<&'a Path>,
+) -> Option<&'a Path> {
+    worktrees
+        .iter()
+        .find(|worktree| worktree.is_main)
+        .map(|worktree| worktree.path.as_path())
+        .or(repository_identity_path)
 }
 
 fn remove_worktree_command(path: &Path, force: bool) -> String {
@@ -407,6 +577,13 @@ impl Render for DeleteWorktreeTooltip {
 }
 
 impl WorktreePickerDelegate {
+    fn worktree_name_anchor(&self) -> Option<&Path> {
+        worktree_name_anchor(
+            &self.all_worktrees,
+            self.repository_identity_path.as_deref(),
+        )
+    }
+
     fn build_fixed_entries(&self) -> Vec<WorktreeEntry> {
         worktree_create_targets(
             self.has_multiple_repositories,
@@ -436,6 +613,102 @@ impl WorktreePickerDelegate {
         } else {
             None
         }
+    }
+
+    fn status_for_worktree(&self, worktree: &GitWorktree, cx: &App) -> WorktreePickerStatus {
+        let fallback_repository_id = self.repository_id.unwrap_or(RepositoryId(0));
+        let fallback_identity_path = self.repository_identity_path.clone().unwrap_or_default();
+        let project = self.project.read(cx);
+        let repositories = project.repositories(cx);
+        let worktree_repository = repositories.values().find(|repository| {
+            repository.read(cx).work_directory_abs_path.as_ref() == worktree.path.as_path()
+        });
+        let identity_repository = repositories.values().find(|repository| {
+            let repository = repository.read(cx);
+            worktree_matches_repository(
+                worktree.path.as_path(),
+                Some(repository.work_directory_abs_path.as_ref()),
+                repo_identity_path_if_local(&repository.common_dir_abs_path, repository.path_style),
+                self.repository_identity_path.as_deref(),
+            )
+        });
+
+        let (repository_id, repository_identity_path) =
+            if let Some(repository) = identity_repository {
+                let snapshot = repository.read(cx);
+                let identity_path =
+                    repo_identity_path_if_local(&snapshot.common_dir_abs_path, snapshot.path_style)
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| fallback_identity_path.clone());
+                (snapshot.id, identity_path)
+            } else {
+                (fallback_repository_id, fallback_identity_path)
+            };
+        let is_dirty = worktree_repository.map(|repository| {
+            let snapshot = repository.read(cx);
+            snapshot.status_summary().count > 0
+        });
+
+        let tracking = identity_repository.and_then(|repository| {
+            worktree.branch_name().and_then(|branch_name| {
+                repository
+                    .read(cx)
+                    .branch_list
+                    .iter()
+                    .find(|branch| branch.name() == branch_name)
+                    .and_then(|branch| branch.tracking_status())
+            })
+        });
+
+        WorktreePickerStatus {
+            repository_id,
+            repository_identity_path,
+            is_dirty,
+            ahead: tracking.map(|tracking| tracking.ahead),
+            behind: tracking.map(|tracking| tracking.behind),
+        }
+    }
+
+    fn refresh_worktree_statuses(&mut self, cx: &App) {
+        let previous_statuses = std::mem::take(&mut self.worktree_statuses);
+        self.worktree_statuses = self
+            .all_worktrees
+            .iter()
+            .map(|worktree| {
+                let mut status = self.status_for_worktree(worktree, cx);
+                if let Some(previous) = previous_statuses.get(&worktree.path) {
+                    if status.is_dirty.is_none() {
+                        status.is_dirty = previous.is_dirty;
+                    }
+                }
+                (worktree.path.clone(), status)
+            })
+            .collect();
+    }
+    fn worktree_status(&self, worktree_path: &Path) -> WorktreePickerStatus {
+        self.worktree_statuses
+            .get(worktree_path)
+            .cloned()
+            .unwrap_or_else(|| WorktreePickerStatus {
+                repository_id: self.repository_id.unwrap_or(RepositoryId(0)),
+                repository_identity_path: self.repository_identity_path.clone().unwrap_or_default(),
+                is_dirty: None,
+                ahead: None,
+                behind: None,
+            })
+    }
+
+    fn sorted_worktree_rows(&self) -> Vec<WorktreePickerRow> {
+        build_worktree_picker_view_model(
+            self.all_worktrees
+                .iter()
+                .cloned()
+                .map(|worktree| {
+                    let status = self.worktree_status(&worktree.path);
+                    (worktree, status)
+                })
+                .collect(),
+        )
     }
 
     fn can_delete_worktree(&self, worktree: &GitWorktree) -> bool {
@@ -495,12 +768,7 @@ impl WorktreePickerDelegate {
             return;
         };
         let path = worktree.path.clone();
-        let display_name = worktree.directory_name(
-            self.all_worktrees
-                .iter()
-                .find(|worktree| worktree.is_main)
-                .map(|worktree| worktree.path.as_path()),
-        );
+        let display_name = worktree.directory_name(self.worktree_name_anchor());
         let workspace = self.workspace.clone();
 
         self.deleting_worktree_paths.insert(path.clone());
@@ -784,13 +1052,9 @@ impl PickerDelegate for WorktreePickerDelegate {
         let repo_worktrees = self.all_repo_worktrees().to_vec();
 
         let normalized_query = query.replace(' ', "-");
-        let main_worktree_path = self
-            .all_worktrees
-            .iter()
-            .find(|wt| wt.is_main)
-            .map(|wt| wt.path.clone());
+        let worktree_name_anchor = self.worktree_name_anchor().map(Path::to_path_buf);
         let has_named_worktree = self.all_worktrees.iter().any(|worktree| {
-            worktree.directory_name(main_worktree_path.as_deref()) == normalized_query
+            worktree.directory_name(worktree_name_anchor.as_deref()) == normalized_query
         });
         let create_named_disabled_reason: Option<String> = if self.has_multiple_repositories {
             Some("Cannot create a named worktree in a project with multiple repositories".into())
@@ -808,31 +1072,20 @@ impl PickerDelegate for WorktreePickerDelegate {
             let mut matches = self.build_fixed_entries();
 
             if !repo_worktrees.is_empty() {
-                let main_worktree_path = repo_worktrees
-                    .iter()
-                    .find(|wt| wt.is_main)
-                    .map(|wt| wt.path.clone());
-
                 let project_paths = &self.project_worktree_paths;
-
-                let sort_by_name = |a: &GitWorktree, b: &GitWorktree| {
-                    a.directory_name(main_worktree_path.as_deref())
-                        .cmp(&b.directory_name(main_worktree_path.as_deref()))
-                };
-
-                let (mut open_here, mut others): (Vec<_>, Vec<_>) = repo_worktrees
+                let (mut open_here, others): (Vec<_>, Vec<_>) = self
+                    .sorted_worktree_rows()
                     .into_iter()
-                    .partition(|worktree| project_paths.contains(&worktree.path));
-                open_here.sort_by(sort_by_name);
-                others.sort_by(sort_by_name);
+                    .partition(|row| project_paths.contains(&row.worktree.path));
 
                 matches.push(WorktreeEntry::Separator);
 
                 if open_here.len() > 1 {
                     matches.push(WorktreeEntry::SectionHeader("This Window".into()));
-                    for worktree in open_here {
+                    for row in open_here.drain(..) {
                         matches.push(WorktreeEntry::Worktree {
-                            worktree,
+                            worktree: row.worktree,
+                            status: row.status,
                             positions: Vec::new(),
                         });
                     }
@@ -841,16 +1094,18 @@ impl PickerDelegate for WorktreePickerDelegate {
                         matches.push(WorktreeEntry::Separator);
                     }
 
-                    for worktree in others {
+                    for row in others {
                         matches.push(WorktreeEntry::Worktree {
-                            worktree,
+                            worktree: row.worktree,
+                            status: row.status,
                             positions: Vec::new(),
                         });
                     }
                 } else {
-                    for worktree in open_here.into_iter().chain(others) {
+                    for row in open_here.into_iter().chain(others) {
                         matches.push(WorktreeEntry::Worktree {
-                            worktree,
+                            worktree: row.worktree,
+                            status: row.status,
                             positions: Vec::new(),
                         });
                     }
@@ -862,17 +1117,13 @@ impl PickerDelegate for WorktreePickerDelegate {
             return Task::ready(());
         }
 
-        let main_worktree_path = repo_worktrees
-            .iter()
-            .find(|wt| wt.is_main)
-            .map(|wt| wt.path.clone());
         let candidates: Vec<_> = repo_worktrees
             .iter()
             .enumerate()
             .map(|(ix, worktree)| {
                 StringMatchCandidate::new(
                     ix,
-                    &worktree.directory_name(main_worktree_path.as_deref()),
+                    &worktree.directory_name(worktree_name_anchor.as_deref()),
                 )
             })
             .collect();
@@ -893,6 +1144,14 @@ impl PickerDelegate for WorktreePickerDelegate {
         });
 
         let repo_worktrees_clone = repo_worktrees;
+        let worktree_statuses = self.worktree_statuses.clone();
+        let fallback_status = WorktreePickerStatus {
+            repository_id: self.repository_id.unwrap_or(RepositoryId(0)),
+            repository_identity_path: self.repository_identity_path.clone().unwrap_or_default(),
+            is_dirty: None,
+            ahead: None,
+            behind: None,
+        };
         cx.spawn_in(window, async move |picker, cx| {
             let fuzzy_matches = task.await;
 
@@ -901,8 +1160,14 @@ impl PickerDelegate for WorktreePickerDelegate {
                     let mut new_matches: Vec<WorktreeEntry> = Vec::new();
 
                     for candidate in &fuzzy_matches {
+                        let worktree = repo_worktrees_clone[candidate.candidate_id].clone();
+                        let status = worktree_statuses
+                            .get(&worktree.path)
+                            .cloned()
+                            .unwrap_or_else(|| fallback_status.clone());
                         new_matches.push(WorktreeEntry::Worktree {
-                            worktree: repo_worktrees_clone[candidate.candidate_id].clone(),
+                            worktree,
+                            status,
                             positions: candidate.positions.clone(),
                         });
                     }
@@ -999,18 +1264,14 @@ impl PickerDelegate for WorktreePickerDelegate {
                             cx,
                         );
                     } else {
-                        let main_worktree_path = self
-                            .all_worktrees
-                            .iter()
-                            .find(|wt| wt.is_main)
-                            .map(|wt| wt.path.as_path());
                         if let Some(workspace) = self.workspace.upgrade() {
                             workspace.update(cx, |workspace, cx| {
                                 crate::worktree_service::handle_switch_worktree(
                                     workspace,
                                     &SwitchWorktree {
                                         path: worktree.path.clone(),
-                                        display_name: worktree.directory_name(main_worktree_path),
+                                        display_name: worktree
+                                            .directory_name(self.worktree_name_anchor()),
                                     },
                                     window,
                                     self.focused_dock,
@@ -1118,14 +1379,10 @@ impl PickerDelegate for WorktreePickerDelegate {
             }
             WorktreeEntry::Worktree {
                 worktree,
+                status,
                 positions,
             } => {
-                let main_worktree_path = self
-                    .all_worktrees
-                    .iter()
-                    .find(|wt| wt.is_main)
-                    .map(|wt| wt.path.as_path());
-                let display_name = worktree.directory_name(main_worktree_path);
+                let display_name = worktree.directory_name(self.worktree_name_anchor());
                 let first_line = display_name.lines().next().unwrap_or(&display_name);
                 let positions: Vec<_> = positions
                     .iter()
@@ -1134,6 +1391,21 @@ impl PickerDelegate for WorktreePickerDelegate {
                     .collect();
                 let path = worktree.path.compact().to_string_lossy().to_string();
                 let sha = worktree.sha.chars().take(7).collect::<String>();
+                let branch_name = worktree.branch_name();
+                let branch_label = branch_name.unwrap_or("detached");
+                let dirty_label = worktree_dirty_label(status.is_dirty);
+                let tracking_label =
+                    worktree_tracking_label(branch_name, status.ahead, status.behind);
+                let repository_identity = if status.repository_identity_path.as_os_str().is_empty()
+                {
+                    "unavailable".to_string()
+                } else {
+                    status
+                        .repository_identity_path
+                        .compact()
+                        .to_string_lossy()
+                        .to_string()
+                };
 
                 let is_current = self.active_worktree_paths.contains(&worktree.path);
                 let is_deleting = self.deleting_worktree_paths.contains(&worktree.path);
@@ -1178,22 +1450,55 @@ impl PickerDelegate for WorktreePickerDelegate {
                                             h_flex()
                                                 .w_full()
                                                 .min_w_0()
-                                                .gap_1p5()
-                                                .when_some(
-                                                    worktree.branch_name().map(|b| b.to_string()),
-                                                    |this, branch| {
-                                                        this.child(
-                                                            Label::new(branch)
-                                                                .size(LabelSize::Small)
-                                                                .color(Color::Muted),
-                                                        )
-                                                        .child(
-                                                            Label::new("\u{2022}")
-                                                                .alpha(0.5)
-                                                                .color(Color::Muted)
-                                                                .size(LabelSize::Small),
-                                                        )
-                                                    },
+                                                .child(
+                                                    Label::new(branch_label)
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new("\u{2022}")
+                                                        .alpha(0.5)
+                                                        .color(Color::Muted)
+                                                        .size(LabelSize::Small),
+                                                )
+                                                .child(
+                                                    Label::new(dirty_label)
+                                                        .size(LabelSize::Small)
+                                                        .color(if status.is_dirty == Some(true) {
+                                                            Color::Error
+                                                        } else {
+                                                            Color::Muted
+                                                        }),
+                                                )
+                                                .child(
+                                                    Label::new("\u{2022}")
+                                                        .alpha(0.5)
+                                                        .color(Color::Muted)
+                                                        .size(LabelSize::Small),
+                                                )
+                                                .when(!tracking_label.is_empty(), |this| {
+                                                    this.child(
+                                                        Label::new(tracking_label)
+                                                            .size(LabelSize::Small)
+                                                            .color(Color::Muted),
+                                                    )
+                                                    .child(
+                                                        Label::new("\u{2022}")
+                                                            .alpha(0.5)
+                                                            .color(Color::Muted)
+                                                            .size(LabelSize::Small),
+                                                    )
+                                                })
+                                                .child(
+                                                    Label::new(repository_identity)
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new("\u{2022}")
+                                                        .alpha(0.5)
+                                                        .color(Color::Muted)
+                                                        .size(LabelSize::Small),
                                                 )
                                                 .when(!sha.is_empty(), |this| {
                                                     this.child(
@@ -1429,7 +1734,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                 Button::new("configure-worktree-tasks", "Automate Setup")
                     .key_binding(
                         KeyBinding::for_action_in(&OpenWorktreeSetupTasks, &focus_handle, cx)
-                            .map(|kb| kb.size(rems_from_px(12.))),
+                            .map(|kb| kb.size(rems_from_px(12_f32))),
                     )
                     .on_click(|_, window, cx| {
                         window.dispatch_action(OpenWorktreeSetupTasks.boxed_clone(), cx)
@@ -1443,7 +1748,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                         Button::new("create-worktree", "Create")
                             .key_binding(
                                 KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
-                                    .map(|kb| kb.size(rems_from_px(12.))),
+                                    .map(|kb| kb.size(rems_from_px(12_f32))),
                             )
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(menu::Confirm.boxed_clone(), cx)
@@ -1474,7 +1779,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                                 &focus_handle,
                                                 cx,
                                             )
-                                            .map(|kb| kb.size(rems_from_px(12.))),
+                                            .map(|kb| kb.size(rems_from_px(12_f32))),
                                         )
                                         .on_click(|_, window, cx| {
                                             window.dispatch_action(DeleteWorktree.boxed_clone(), cx)
@@ -1491,7 +1796,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                                 &focus_handle,
                                                 cx,
                                             )
-                                            .map(|kb| kb.size(rems_from_px(12.))),
+                                            .map(|kb| kb.size(rems_from_px(12_f32))),
                                         )
                                         .on_click(|_, window, cx| {
                                             window.dispatch_action(
@@ -1510,7 +1815,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                                                 &focus_handle,
                                                 cx,
                                             )
-                                            .map(|kb| kb.size(rems_from_px(12.))),
+                                            .map(|kb| kb.size(rems_from_px(12_f32))),
                                         )
                                         .on_click(|_, window, cx| {
                                             window.dispatch_action(menu::Confirm.boxed_clone(), cx)
@@ -1682,6 +1987,21 @@ mod tests {
             ProjectSettings::register(cx);
             WorktreeSettings::register(cx);
         });
+    }
+
+    #[test]
+    fn test_bare_repository_worktree_uses_generated_name() {
+        let worktree = GitWorktree {
+            path: PathBuf::from("/worktrees/zed/plum-warbler/zed"),
+            ref_name: None,
+            sha: "8166e3d".into(),
+            is_main: false,
+            is_bare: false,
+        };
+        let worktrees = [worktree.clone()];
+        let name_anchor = worktree_name_anchor(&worktrees, Some(Path::new("/repos/zed")));
+
+        assert_eq!(worktree.directory_name(name_anchor), "plum-warbler");
     }
 
     async fn init_worktree_picker_test(
@@ -2301,5 +2621,258 @@ mod tests {
             repo_contains_worktree(&repository, &worktree_path, &mut cx).await,
             "removing the worktree from the window should not delete the git worktree"
         );
+    }
+    #[test]
+    fn worktree_picker_view_model_keeps_stable_order_and_all_context() {
+        let repository_one = project::git_store::RepositoryId(7);
+        let repository_two = project::git_store::RepositoryId(8);
+        let repository_one_identity = PathBuf::from("/repos/one/app");
+        let repository_two_identity = PathBuf::from("/repos/two/app");
+        let make_worktree =
+            |repository: &str, name: &str, branch: Option<&str>, is_main: bool| GitWorktree {
+                path: PathBuf::from(format!("/repos/{repository}/{name}")),
+                ref_name: branch.map(|branch| format!("refs/heads/{branch}").into()),
+                sha: "0123456789abcdef".into(),
+                is_main,
+                is_bare: false,
+            };
+        let status = |repository_id, repository_identity_path, is_dirty, ahead, behind| {
+            WorktreePickerStatus {
+                repository_id,
+                repository_identity_path,
+                is_dirty,
+                ahead,
+                behind,
+            }
+        };
+
+        let rows = build_worktree_picker_view_model(vec![
+            (
+                make_worktree("one", "behind", Some("behind"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(3),
+                ),
+            ),
+            (
+                make_worktree("one", "detached", None, false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
+            ),
+            (
+                make_worktree("one", "dirty", Some("dirty"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(true),
+                    Some(0),
+                    Some(0),
+                ),
+            ),
+            (
+                make_worktree("one", "ahead", Some("ahead"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(4),
+                    Some(0),
+                ),
+            ),
+            (
+                make_worktree("one", "main", Some("main"), true),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(0),
+                ),
+            ),
+            (
+                make_worktree("one", "missing-upstream", Some("local"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
+            ),
+            (
+                make_worktree("one", "shared", Some("shared"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(1),
+                    Some(2),
+                ),
+            ),
+            (
+                make_worktree("two", "shared", Some("shared"), false),
+                status(
+                    repository_two,
+                    repository_two_identity.clone(),
+                    Some(true),
+                    Some(3),
+                    Some(0),
+                ),
+            ),
+        ]);
+
+        let context = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.worktree
+                        .directory_name(Some(&row.status.repository_identity_path)),
+                    row.worktree.branch_name().map(str::to_owned),
+                    row.worktree.path.clone(),
+                    row.status.repository_id,
+                    row.status.repository_identity_path.clone(),
+                    row.status.is_dirty,
+                    row.status.ahead,
+                    row.status.behind,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            context,
+            vec![
+                (
+                    "ahead".to_string(),
+                    Some("ahead".to_string()),
+                    PathBuf::from("/repos/one/ahead"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(4),
+                    Some(0),
+                ),
+                (
+                    "behind".to_string(),
+                    Some("behind".to_string()),
+                    PathBuf::from("/repos/one/behind"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(3),
+                ),
+                (
+                    "detached".to_string(),
+                    None,
+                    PathBuf::from("/repos/one/detached"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
+                (
+                    "dirty".to_string(),
+                    Some("dirty".to_string()),
+                    PathBuf::from("/repos/one/dirty"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(true),
+                    Some(0),
+                    Some(0),
+                ),
+                (
+                    "main worktree".to_string(),
+                    Some("main".to_string()),
+                    PathBuf::from("/repos/one/main"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(0),
+                ),
+                (
+                    "missing-upstream".to_string(),
+                    Some("local".to_string()),
+                    PathBuf::from("/repos/one/missing-upstream"),
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
+                (
+                    "shared".to_string(),
+                    Some("shared".to_string()),
+                    PathBuf::from("/repos/one/shared"),
+                    repository_one,
+                    repository_one_identity,
+                    Some(false),
+                    Some(1),
+                    Some(2),
+                ),
+                (
+                    "shared".to_string(),
+                    Some("shared".to_string()),
+                    PathBuf::from("/repos/two/shared"),
+                    repository_two,
+                    repository_two_identity,
+                    Some(true),
+                    Some(3),
+                    Some(0),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_picker_status_labels_are_explicit_for_all_tracking_states() {
+        assert_eq!(worktree_dirty_label(Some(false)), "clean");
+        assert_eq!(worktree_dirty_label(Some(true)), "dirty");
+        assert_eq!(worktree_dirty_label(None), "unavailable");
+        assert_eq!(worktree_tracking_label(None, None, None), "not applicable");
+        assert_eq!(
+            worktree_tracking_label(Some("feature"), None, None),
+            "unavailable"
+        );
+        assert_eq!(
+            worktree_tracking_label(Some("feature"), Some(4), Some(2)),
+            "↑4 ↓2"
+        );
+        assert_eq!(
+            worktree_tracking_label(Some("feature"), Some(0), Some(0)),
+            "up to date"
+        );
+    }
+    #[test]
+    fn worktree_picker_tracking_lookup_requires_repository_identity() {
+        let worktree_path = Path::new("/repos/one/linked");
+        let picker_identity = Path::new("/repos/one/.git");
+        assert!(worktree_matches_repository(
+            worktree_path,
+            None,
+            Some(picker_identity),
+            Some(picker_identity),
+        ));
+        assert!(!worktree_matches_repository(
+            worktree_path,
+            None,
+            Some(Path::new("/repos/two/.git")),
+            Some(picker_identity),
+        ));
+        assert!(!worktree_matches_repository(
+            worktree_path,
+            None,
+            None,
+            None
+        ));
     }
 }

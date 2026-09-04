@@ -2492,6 +2492,9 @@ impl GitRepository for RealGitRepository {
         paths: Vec<RepoPath>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
+        if paths.is_empty() {
+            return async { Ok(()) }.boxed();
+        }
         let git = self.git_binary_in_worktree();
         self.executor
             .spawn(async move {
@@ -6380,5 +6383,96 @@ mod tests {
             remote_urls.get("upstream").unwrap(),
             "/Users/user/My Projects/upstream.git"
         );
+    }
+}
+
+#[cfg(test)]
+mod stash_selected_tests {
+    use std::{ffi::OsStr, fs, path::Path, sync::Arc};
+
+    use collections::FxHashMap;
+
+    use super::{GitRepository, RealGitRepository};
+    use gpui::TestAppContext;
+
+    #[allow(clippy::disallowed_methods)]
+    fn git_command<I, S>(working_directory: &Path, arguments: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(working_directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+            .output()
+            .expect("failed to run git command");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn status(working_directory: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(working_directory)
+            .output()
+            .expect("failed to read git status");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn git_output<I, S>(working_directory: &Path, arguments: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(working_directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .output()
+            .expect("failed to run git command");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+    #[gpui::test]
+    async fn empty_selected_paths_do_not_stash_everything(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        git_command(temp_dir.path(), ["init", "-b", "main"]);
+        fs::write(temp_dir.path().join("selected.txt"), "before").unwrap();
+        git_command(temp_dir.path(), ["add", "selected.txt"]);
+        git_command(temp_dir.path(), ["commit", "-m", "initial"]);
+        fs::write(temp_dir.path().join("selected.txt"), "after").unwrap();
+
+        let repo = RealGitRepository::new(
+            &temp_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        repo.stash_paths(Vec::new(), Arc::new(FxHashMap::default()))
+            .await
+            .unwrap();
+
+        assert_eq!(status(temp_dir.path()), " M selected.txt\n");
+        assert!(git_output(temp_dir.path(), ["stash", "list"]).is_empty());
     }
 }

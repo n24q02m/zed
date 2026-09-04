@@ -74,6 +74,8 @@ actions!(
         UnstageAll,
         /// Stashes all changes in the repository, including untracked files.
         StashAll,
+        /// Stashes changes for the selected file or directory.
+        StashFile,
         /// Pops the most recent stash.
         StashPop,
         /// Apply the most recent stash.
