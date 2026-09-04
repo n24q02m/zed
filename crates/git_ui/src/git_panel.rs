@@ -3858,8 +3858,12 @@ impl GitPanel {
         let Some(section) = self.section_for_entry_index(selected_index) else {
             return;
         };
-        self.toggle_staged_for_entry(
+        let Some(repository_id) = self.repository_id_for_entry_index(selected_index) else {
+            return;
+        };
+        self.toggle_staged_for_entry_in_repository(
             &GitListEntry::Header(GitHeaderEntry { header: section }),
+            repository_id,
             intent,
             window,
             cx,
@@ -9843,9 +9847,6 @@ impl GitPanel {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let marked = self
-            .entry_identity(ix)
-            .is_some_and(|entry| self.marked_entries.contains(&entry));
         let selected = self.selected_entry == Some(ix);
         let label_color = Color::Muted;
 
