@@ -86,6 +86,10 @@ jobs:
           }
           # Keep Cargo's Git checkout cache below Windows MAX_PATH; Rustup remains on the runner default.
           New-Item -ItemType Directory -Force $env:CARGO_HOME | Out-Null
+          $preBuild = git status --porcelain --untracked-files=normal
+          if ($preBuild) {
+            throw "candidate source worktree was not clean before bundling: $preBuild"
+          }
           $sourceScript = Get-Content "script/bundle-windows.ps1" -Raw
           $hardcodedDevShell = '& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1"'
           $patchedDevShell = '& "' + $vsDevShell + '"'
@@ -103,9 +107,20 @@ jobs:
               Remove-Item -Force $bundleScript
             }
           }
-          $dirty = git status --porcelain
-          if ($dirty) {
-            throw "candidate source worktree changed during bundling: $dirty"
+          $allowedUntracked = @(
+            '?? AGS_SDK-6.3.0/',
+            '?? AGS_SDK_v6.3.0.zip',
+            '?? Microsoft.Windows.Console.ConPTY.1.23.251216003.nupkg',
+            '?? conpty/',
+            '?? inno/'
+          )
+          if (Test-Path $bundleScript) {
+            throw "temporary patched bundle script was not removed: $bundleScript"
+          }
+          $postBuild = git status --porcelain --untracked-files=normal
+          $unexpected = @($postBuild | Where-Object { $allowedUntracked -notcontains $_ })
+          if ($unexpected.Count -gt 0) {
+            throw "candidate source worktree changed during bundling: $($unexpected -join "`n")"
           }
 
       - name: Record binary provenance
