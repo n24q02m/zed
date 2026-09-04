@@ -10124,6 +10124,13 @@ pub fn repo_identity_path(common_dir: &Path) -> &Path {
         common_dir
     }
 }
+/// Returns the repository identity only when `std::path` can interpret the path correctly.
+///
+/// Callers whose downstream path operations are not yet `PathStyle`-aware use this to preserve
+/// their existing behavior for foreign path styles.
+pub fn repo_identity_path_if_local(common_dir: &Path, path_style: PathStyle) -> Option<&Path> {
+    (path_style == PathStyle::local()).then(|| repo_identity_path(common_dir))
+}
 
 /// Returns true if `git_dir` is a Git submodule's git directory.
 ///
