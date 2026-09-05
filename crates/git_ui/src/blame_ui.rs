@@ -409,6 +409,8 @@ impl BlameRenderer for GitBlameRenderer {
         let hover_actions = available_blame_hover_actions(&blame);
         let blame_revision_target = blame.revision_target(None);
         let show_blame_revision_action = hover_actions.contains(&BlameHoverAction::BlameAtRevision);
+        let blame_revision_repository = repository.clone();
+        let blame_revision_workspace = workspace.clone();
 
         Some(
             tooltip_container(cx, |this, cx| {
@@ -518,8 +520,10 @@ impl BlameRenderer for GitBlameRenderer {
                                                     .clone()
                                                     .filter(|_| show_blame_revision_action),
                                                 |this, (revision, path)| {
-                                                    let repository = repository.clone();
-                                                    let workspace = workspace.clone();
+                                                    let repository =
+                                                        blame_revision_repository.clone();
+                                                    let workspace =
+                                                        blame_revision_workspace.clone();
                                                     this.child(
                                                         Button::new(
                                                             "blame-revision-button",
