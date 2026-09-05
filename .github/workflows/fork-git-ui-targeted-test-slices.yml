@@ -71,34 +71,34 @@ jobs:
           if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
             throw "MSVC compiler was unavailable after entering the Visual Studio developer shell"
           }
-          # Cargo's default user-profile cache cannot check out the pinned
-          # dependency fixture within Windows MAX_PATH. Keep only Cargo's cache
-          # at this short job-local root; rustup remains at the runner default.
-          New-Item -ItemType Directory -Force $env:CARGO_HOME | Out-Null
-          $testLog = Join-Path $env:RUNNER_TEMP "fork-git-ui-targeted-test-slices.log"
-          # Union filter selects exactly the slice tests present in the target
-          # tree (heatmap and/or blame_hover); absent from other baselines, so
-          # a zero-match run stays a fail-closed rejection, never a pass.
-          & cargo --color never test -p git_ui --lib heatmap blame_hover -- 2>&1 | Tee-Object -FilePath $testLog
-          if ($LASTEXITCODE -ne 0) {
-            throw "slice Git UI tests failed with cargo exit code $LASTEXITCODE"
-          }
-          $testOutput = Get-Content -Raw $testLog
-          $resultMatches = [regex]::Matches($testOutput, "test result: ok\. (\d+) passed; (\d+) failed;")
-          if ($resultMatches.Count -lt 1) {
-            throw "slice Git UI tests reported no ok result line: $testOutput"
-          }
+          # One filter per slice: the pinned cargo accepts a single TESTNAME,
+          # so each slice filter runs separately. A filter absent from the
+          # target tree matches zero tests and exits ok; the totals below keep
+          # that a fail-closed rejection, never a pass.
+          $testFilters = @("heatmap", "blame_hover")
           $passedTotal = 0
           $failedTotal = 0
-          foreach ($resultMatch in $resultMatches) {
-            $passedTotal += [int]$resultMatch.Groups[1].Value
-            $failedTotal += [int]$resultMatch.Groups[2].Value
+          foreach ($testFilter in $testFilters) {
+            $testLog = Join-Path $env:RUNNER_TEMP "fork-git-ui-targeted-test-slices-$testFilter.log"
+            & cargo --color never test -p git_ui --lib $testFilter -- 2>&1 | Tee-Object -FilePath $testLog
+            if ($LASTEXITCODE -ne 0) {
+              throw "slice Git UI tests ($testFilter) failed with cargo exit code $LASTEXITCODE"
+            }
+            $filterOutput = Get-Content -Raw $testLog
+            $resultMatches = [regex]::Matches($filterOutput, "test result: ok\. (\d+) passed; (\d+) failed;")
+            if ($resultMatches.Count -lt 1) {
+              throw "slice Git UI tests ($testFilter) reported no ok result line: $filterOutput"
+            }
+            foreach ($resultMatch in $resultMatches) {
+              $passedTotal += [int]$resultMatch.Groups[1].Value
+              $failedTotal += [int]$resultMatch.Groups[2].Value
+            }
           }
           if ($failedTotal -ne 0) {
-            throw "slice Git UI tests reported $failedTotal failures: $testOutput"
+            throw "slice Git UI tests reported $failedTotal failures"
           }
           if ($passedTotal -lt 1) {
-            throw "slice Git UI tests executed zero tests (filter matched nothing): $testOutput"
+            throw "slice Git UI tests executed zero tests (filters matched nothing)"
           }
           cargo fmt --all -- --check
           if ($LASTEXITCODE -ne 0) {
