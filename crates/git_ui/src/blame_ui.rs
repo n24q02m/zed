@@ -28,6 +28,8 @@ use util::paths::PathStyle;
 use workspace::{Workspace, notifications::NotifyTaskExt as _};
 
 const GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED: usize = 20;
+const BLAME_HOVER_MISSING_AUTHOR_DISPLAY: &str = "<no name>";
+const BLAME_HOVER_MISSING_SUMMARY_DISPLAY: &str = "<no commit message>";
 const GIT_BLAME_GUTTER_MARGIN: Rems = rems(0.5);
 const GIT_BLAME_GUTTER_GAP: Rems = rems(0.5);
 const GIT_BLAME_AVATAR_SIZE: Rems = rems(1.);
@@ -403,6 +405,12 @@ impl BlameRenderer for GitBlameRenderer {
             .boundary
             .then(|| shallow_boundary_notice(repository.clone(), workspace.clone(), window, cx))
             .flatten();
+        let hover_metadata = blame_hover_metadata(&blame);
+        let hover_actions = available_blame_hover_actions(&blame);
+        let blame_revision_target = blame.revision_target(None);
+        let show_blame_revision_action = hover_actions.contains(&BlameHoverAction::BlameAtRevision);
+        let blame_revision_repository = repository.clone();
+        let blame_revision_workspace = workspace.clone();
 
         Some(
             tooltip_container(cx, |this, cx| {
@@ -429,6 +437,14 @@ impl BlameRenderer for GitBlameRenderer {
                                                 .child(author_email.to_owned()),
                                         )
                                     }),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .text_color(cx.theme().colors().text_muted)
+                                    .child(hover_metadata.short_commit_hash.clone())
+                                    .child(hover_metadata.summary_display.clone())
+                                    .child(hover_metadata.relative_timestamp.clone()),
                             )
                             .children(boundary_notice)
                             .child(
@@ -498,6 +514,41 @@ impl BlameRenderer for GitBlameRenderer {
                                                     );
                                                     cx.stop_propagation();
                                                 }),
+                                            )
+                                            .when_some(
+                                                blame_revision_target
+                                                    .clone()
+                                                    .filter(|_| show_blame_revision_action),
+                                                |this, (revision, path)| {
+                                                    let repository =
+                                                        blame_revision_repository.clone();
+                                                    let workspace =
+                                                        blame_revision_workspace.clone();
+                                                    this.child(
+                                                        Button::new(
+                                                            "blame-revision-button",
+                                                            "Blame Revision",
+                                                        )
+                                                        .color(Color::Muted)
+                                                        .start_icon(
+                                                            Icon::new(IconName::FileGit)
+                                                                .size(IconSize::Small)
+                                                                .color(Color::Muted),
+                                                        )
+                                                        .on_click(move |_, window, cx| {
+                                                            open_buffer_blame_at_revision(
+                                                                repository.clone(),
+                                                                workspace.clone(),
+                                                                path.clone(),
+                                                                revision,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        }),
+                                                    )
+                                                    .child(Divider::vertical())
+                                                },
                                             )
                                             .child(Divider::vertical())
                                             .child(
@@ -772,5 +823,132 @@ fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {
             )
         }
         Err(_) => "Error parsing date".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlameHoverMetadata {
+    short_commit_hash: String,
+    author_display: String,
+    summary_display: String,
+    relative_timestamp: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlameHoverAction {
+    CopyCommitHash,
+    OpenCommit,
+    BlameAtRevision,
+}
+
+fn blame_hover_metadata(blame_entry: &BlameEntry) -> BlameHoverMetadata {
+    let short_commit_hash = blame_entry.sha.display_short();
+    let author_display = match blame_entry.author.as_deref() {
+        Some(author_name) if !author_name.trim().is_empty() => {
+            util::truncate_and_trailoff(author_name, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED)
+                .to_string()
+        }
+        _ => BLAME_HOVER_MISSING_AUTHOR_DISPLAY.to_string(),
+    };
+    let summary_display = match blame_entry.summary.as_deref() {
+        Some(summary_text) => match summary_text.lines().next() {
+            Some(first_line) => {
+                let trimmed_line = first_line.trim_end();
+                if trimmed_line.is_empty() {
+                    BLAME_HOVER_MISSING_SUMMARY_DISPLAY.to_string()
+                } else {
+                    trimmed_line.to_string()
+                }
+            }
+            None => BLAME_HOVER_MISSING_SUMMARY_DISPLAY.to_string(),
+        },
+        None => BLAME_HOVER_MISSING_SUMMARY_DISPLAY.to_string(),
+    };
+    let relative_timestamp = blame_entry_relative_timestamp(blame_entry);
+    BlameHoverMetadata {
+        short_commit_hash,
+        author_display,
+        summary_display,
+        relative_timestamp,
+    }
+}
+
+fn available_blame_hover_actions(blame_entry: &BlameEntry) -> Vec<BlameHoverAction> {
+    if blame_entry.sha.is_zero() {
+        return vec![BlameHoverAction::CopyCommitHash];
+    }
+    let mut hover_actions = vec![
+        BlameHoverAction::CopyCommitHash,
+        BlameHoverAction::OpenCommit,
+    ];
+    let has_revision_target = blame_entry.revision_target(None).is_some();
+    let has_previous_target = blame_entry.previous_revision_target().is_some();
+    if has_revision_target || has_previous_target {
+        hover_actions.push(BlameHoverAction::BlameAtRevision);
+    }
+    hover_actions
+}
+
+#[cfg(test)]
+mod blame_hover_tests {
+    use super::*;
+    use git::{Oid, blame::BlameEntry};
+
+    fn full_hover_blame_entry() -> BlameEntry {
+        let commit_oid: Oid = "abc1234000000000000000000000000000000000"
+            .parse()
+            .expect("valid test commit hash");
+        BlameEntry {
+            sha: commit_oid,
+            range: 0..1,
+            original_line_number: 1,
+            author: Some("Ada Lovelace".to_string()),
+            author_mail: Some("<ada@example.com>".to_string()),
+            author_time: None,
+            author_tz: None,
+            committer_name: Some("Ada Lovelace".to_string()),
+            committer_email: Some("<ada@example.com>".to_string()),
+            committer_time: None,
+            committer_tz: None,
+            summary: Some("Improve hover".to_string()),
+            previous: None,
+            filename: "src/main.rs".to_string(),
+            boundary: false,
+        }
+    }
+
+    #[test]
+    fn blame_hover_metadata_presents_full_entry() {
+        let metadata = blame_hover_metadata(&full_hover_blame_entry());
+        assert_eq!(metadata.short_commit_hash, "abc1234");
+        assert_eq!(metadata.author_display, "Ada Lovelace");
+        assert_eq!(metadata.summary_display, "Improve hover");
+        assert!(!metadata.relative_timestamp.is_empty());
+    }
+
+    #[test]
+    fn blame_hover_metadata_falls_back_for_missing_author_and_summary() {
+        let mut blame_entry = full_hover_blame_entry();
+        blame_entry.author = None;
+        blame_entry.summary = None;
+        let metadata = blame_hover_metadata(&blame_entry);
+        assert_eq!(metadata.author_display, "<no name>");
+        assert_eq!(metadata.summary_display, "<no commit message>");
+
+        let mut blank_entry = full_hover_blame_entry();
+        blank_entry.author = Some("   ".to_string());
+        blank_entry.summary = Some("   ".to_string());
+        let blank_metadata = blame_hover_metadata(&blank_entry);
+        assert_eq!(blank_metadata.author_display, "<no name>");
+        assert_eq!(blank_metadata.summary_display, "<no commit message>");
+    }
+
+    #[test]
+    fn blame_hover_actions_offer_local_navigation_only() {
+        let hover_actions = available_blame_hover_actions(&full_hover_blame_entry());
+        assert!(hover_actions.contains(&BlameHoverAction::CopyCommitHash));
+        assert!(hover_actions.contains(&BlameHoverAction::OpenCommit));
+        assert!(hover_actions.contains(&BlameHoverAction::BlameAtRevision));
+        assert_eq!(hover_actions.len(), 3);
     }
 }
