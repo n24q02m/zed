@@ -1,0 +1,110 @@
+# Fork-only verifier: compile and run the immutable slice's own Git UI tests.
+# Separate trigger ref (verify/git-ui-targeted-test) so repairing test
+# selection never launches duplicate Windows bundles on
+# verify/windows-ui-smoke.
+name: fork-git-ui-targeted-test-slices
+
+on:
+  push:
+    branches:
+      - verify/git-ui-targeted-test
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test exact fork head slice tests
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: C:/c
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Check out immutable verifier trigger
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          clean: false
+
+      - name: Resolve requested fork commit
+        id: target
+        shell: pwsh
+        run: |
+          $expected = (git log -1 --format=%s).Trim().ToLowerInvariant()
+          if ($expected -notmatch "^[0-9a-f]{40}$") {
+            throw "push verifier commits must use the target SHA as their subject"
+          }
+          "sha=$expected" >> $env:GITHUB_OUTPUT
+
+      - name: Check out requested fork commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          path: source
+          fetch-depth: 1
+          clean: false
+
+      - name: Verify immutable source identity
+        shell: pwsh
+        working-directory: source
+        run: |
+          $expected = "${{ steps.target.outputs.sha }}"
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "checked out $actual, expected $expected"
+          }
+
+      - name: Run slice Git UI tests
+        shell: pwsh
+        working-directory: source
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = (& $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath | Select-Object -First 1 | Out-String).Trim()
+          $vsDevShell = Join-Path $vsInstall "Common7\Tools\Launch-VsDevShell.ps1"
+          if ([string]::IsNullOrWhiteSpace($vsInstall) -or -not (Test-Path $vsDevShell)) {
+            throw "GitHub-hosted Visual Studio developer shell was not found"
+          }
+          & $vsDevShell -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+            throw "MSVC compiler was unavailable after entering the Visual Studio developer shell"
+          }
+          # Cargo's default user-profile cache cannot check out the pinned
+          # dependency fixture within Windows MAX_PATH. Keep only Cargo's cache
+          # at this short job-local root; rustup remains at the runner default.
+          New-Item -ItemType Directory -Force $env:CARGO_HOME | Out-Null
+          $testLog = Join-Path $env:RUNNER_TEMP "fork-git-ui-targeted-test-slices.log"
+          # Union filter selects exactly the slice tests present in the target
+          # tree (heatmap and/or blame_hover); absent from other baselines, so
+          # a zero-match run stays a fail-closed rejection, never a pass.
+          & cargo --color never test -p git_ui --lib heatmap blame_hover -- 2>&1 | Tee-Object -FilePath $testLog
+          if ($LASTEXITCODE -ne 0) {
+            throw "slice Git UI tests failed with cargo exit code $LASTEXITCODE"
+          }
+          $testOutput = Get-Content -Raw $testLog
+          $resultMatches = [regex]::Matches($testOutput, "test result: ok\. (\d+) passed; (\d+) failed;")
+          if ($resultMatches.Count -lt 1) {
+            throw "slice Git UI tests reported no ok result line: $testOutput"
+          }
+          $passedTotal = 0
+          $failedTotal = 0
+          foreach ($resultMatch in $resultMatches) {
+            $passedTotal += [int]$resultMatch.Groups[1].Value
+            $failedTotal += [int]$resultMatch.Groups[2].Value
+          }
+          if ($failedTotal -ne 0) {
+            throw "slice Git UI tests reported $failedTotal failures: $testOutput"
+          }
+          if ($passedTotal -lt 1) {
+            throw "slice Git UI tests executed zero tests (filter matched nothing): $testOutput"
+          }
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo fmt --check failed"
+          }
+          $dirty = git status --porcelain
+          if ($dirty) {
+            throw "candidate source worktree changed during verification: $dirty"
+          }
