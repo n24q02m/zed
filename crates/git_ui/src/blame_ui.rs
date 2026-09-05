@@ -32,6 +32,103 @@ const GIT_BLAME_GUTTER_MARGIN: Rems = rems(0.5);
 const GIT_BLAME_GUTTER_GAP: Rems = rems(0.5);
 const GIT_BLAME_AVATAR_SIZE: Rems = rems(1.);
 
+/// Number of seconds in one day; the base unit for the blame age-heatmap buckets.
+const BLAME_AGE_SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+/// Upper age bound (in days) for the fresh heatmap bucket.
+const BLAME_AGE_FRESH_MAX_DAYS: i64 = 1;
+/// Upper age bound (in days) for the recent heatmap bucket.
+const BLAME_AGE_RECENT_MAX_DAYS: i64 = 30;
+/// Upper age bound (in days) for the old heatmap bucket; older commits are ancient.
+const BLAME_AGE_OLD_MAX_DAYS: i64 = 365;
+
+/// Age bucket of the commit behind a blame row, driving the full-file age heatmap.
+///
+/// Boundaries are expressed in seconds of commit age (`now_unix - committer_time`):
+/// - `Fresh`: younger than 1 day (86_400 seconds). Future timestamps land here too:
+///   clock skew clamps to fresh instead of underflowing.
+/// - `Recent`: at least 1 day old but younger than 30 days (2_592_000 seconds).
+/// - `Old`: at least 30 days old but younger than 365 days (31_536_000 seconds).
+/// - `Ancient`: at least 365 days old.
+/// - `Unknown`: the blame entry carries no commit timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlameAgeBucket {
+    Fresh,
+    Recent,
+    Old,
+    Ancient,
+    Unknown,
+}
+
+/// Classifies a blame commit timestamp into an age bucket for the heatmap.
+///
+/// A missing timestamp maps to `Unknown` and a future timestamp clamps to `Fresh`.
+/// Saturating arithmetic keeps extreme timestamps from overflowing; this function
+/// never panics.
+fn age_bucket(committer_time: Option<i64>, now_unix: i64) -> BlameAgeBucket {
+    let commit_unix = match committer_time {
+        Some(commit_unix) => commit_unix,
+        None => return BlameAgeBucket::Unknown,
+    };
+    let age_seconds = now_unix.saturating_sub(commit_unix);
+    if age_seconds < BLAME_AGE_FRESH_MAX_DAYS * BLAME_AGE_SECONDS_PER_DAY {
+        BlameAgeBucket::Fresh
+    } else if age_seconds < BLAME_AGE_RECENT_MAX_DAYS * BLAME_AGE_SECONDS_PER_DAY {
+        BlameAgeBucket::Recent
+    } else if age_seconds < BLAME_AGE_OLD_MAX_DAYS * BLAME_AGE_SECONDS_PER_DAY {
+        BlameAgeBucket::Old
+    } else {
+        BlameAgeBucket::Ancient
+    }
+}
+
+/// Background tint decision for a blame gutter row.
+///
+/// Precedence is fixed: a selected row always resolves to `Selected`, an
+/// age-bucketed row resolves to its bucket tint, and rows without a timestamp
+/// (or with the heatmap disabled) fall back to `Default`, meaning no tint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlameHeatmapTint {
+    Selected,
+    Fresh,
+    Recent,
+    Old,
+    Ancient,
+    Default,
+}
+
+/// Resolves the row tint from its age bucket and selection state.
+///
+/// Selection is checked first so it always wins over any age tint; the age tint
+/// in turn wins over the default un-tinted background.
+fn blame_heatmap_tint(bucket: BlameAgeBucket, selected: bool) -> BlameHeatmapTint {
+    if selected {
+        return BlameHeatmapTint::Selected;
+    }
+    match bucket {
+        BlameAgeBucket::Fresh => BlameHeatmapTint::Fresh,
+        BlameAgeBucket::Recent => BlameHeatmapTint::Recent,
+        BlameAgeBucket::Old => BlameHeatmapTint::Old,
+        BlameAgeBucket::Ancient => BlameHeatmapTint::Ancient,
+        BlameAgeBucket::Unknown => BlameHeatmapTint::Default,
+    }
+}
+
+/// Maps a tint decision to a concrete gutter-row background.
+///
+/// Fresher commits get a stronger accent wash while the selected row keeps the
+/// standard selection background, so selection stays visually dominant.
+fn blame_heatmap_background(tint: &BlameHeatmapTint, cx: &App) -> Option<Hsla> {
+    let theme_colors = cx.theme().colors();
+    match tint {
+        BlameHeatmapTint::Selected => Some(theme_colors.element_selected),
+        BlameHeatmapTint::Fresh => Some(theme_colors.text_accent.opacity(0.18)),
+        BlameHeatmapTint::Recent => Some(theme_colors.text_accent.opacity(0.12)),
+        BlameHeatmapTint::Old => Some(theme_colors.text_accent.opacity(0.07)),
+        BlameHeatmapTint::Ancient => Some(theme_colors.text_accent.opacity(0.03)),
+        BlameHeatmapTint::Default => None,
+    }
+}
+
 pub struct GitBlameRenderer;
 
 fn format_blame_text(blame_entry: &BlameEntry, cx: &App) -> String {
@@ -173,6 +270,24 @@ impl BlameRenderer for GitBlameRenderer {
             .blame()
             .is_some_and(|blame| blame.read(cx).highlighted_sha() == Some(blame_entry.sha));
 
+        // Age heatmap: classified per visible gutter row, so large files stay virtualized
+        // and no full-file materialization happens here. When the blame gutter is
+        // disabled the bucket is forced to Unknown, which resolves to no tint; a
+        // selected row keeps its pre-existing selection background through the tint.
+        let heatmap_tint = {
+            let heatmap_enabled = editor.read(cx).show_git_blame_gutter();
+            let commit_age_bucket = if heatmap_enabled {
+                age_bucket(
+                    blame_entry.committer_time,
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                )
+            } else {
+                BlameAgeBucket::Unknown
+            };
+            blame_heatmap_tint(commit_age_bucket, is_highlighted)
+        };
+        let heatmap_background = blame_heatmap_background(&heatmap_tint, cx);
+
         let avatar = if ProjectSettings::get_global(cx).git.blame.show_avatar {
             let author_email = blame_entry.author_mail.as_ref().map(|email| {
                 SharedString::from(
@@ -207,8 +322,8 @@ impl BlameRenderer for GitBlameRenderer {
                         .font(style.font())
                         .line_height(style.line_height)
                         .text_color(cx.theme().status().hint)
-                        .when(is_highlighted, |this| {
-                            this.bg(cx.theme().colors().element_selected)
+                        .when_some(heatmap_background, |row, background| {
+                            row.bg(background)
                         })
                         .child(
                             h_flex()
@@ -772,5 +887,129 @@ fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {
             )
         }
         Err(_) => "Error parsing date".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_NOW_UNIX: i64 = 1_700_000_000;
+    const TEST_ONE_DAY_SECONDS: i64 = 86_400;
+    const TEST_THIRTY_DAYS_SECONDS: i64 = 2_592_000;
+    const TEST_YEAR_SECONDS: i64 = 31_536_000;
+
+    fn commit_with_age(age_seconds: i64) -> Option<i64> {
+        Some(TEST_NOW_UNIX - age_seconds)
+    }
+
+    #[test]
+    fn test_age_bucket_without_timestamp_is_unknown() {
+        assert_eq!(age_bucket(None, TEST_NOW_UNIX), BlameAgeBucket::Unknown);
+    }
+
+    #[test]
+    fn test_age_bucket_fresh_below_day_boundary() {
+        assert_eq!(
+            age_bucket(commit_with_age(0), TEST_NOW_UNIX),
+            BlameAgeBucket::Fresh
+        );
+        assert_eq!(
+            age_bucket(commit_with_age(TEST_ONE_DAY_SECONDS - 1), TEST_NOW_UNIX),
+            BlameAgeBucket::Fresh
+        );
+    }
+
+    #[test]
+    fn test_age_bucket_recent_at_day_boundary() {
+        assert_eq!(
+            age_bucket(commit_with_age(TEST_ONE_DAY_SECONDS), TEST_NOW_UNIX),
+            BlameAgeBucket::Recent
+        );
+        assert_eq!(
+            age_bucket(commit_with_age(TEST_THIRTY_DAYS_SECONDS - 1), TEST_NOW_UNIX),
+            BlameAgeBucket::Recent
+        );
+    }
+
+    #[test]
+    fn test_age_bucket_old_at_thirty_day_boundary() {
+        assert_eq!(
+            age_bucket(commit_with_age(TEST_THIRTY_DAYS_SECONDS), TEST_NOW_UNIX),
+            BlameAgeBucket::Old
+        );
+        assert_eq!(
+            age_bucket(commit_with_age(TEST_YEAR_SECONDS - 1), TEST_NOW_UNIX),
+            BlameAgeBucket::Old
+        );
+    }
+
+    #[test]
+    fn test_age_bucket_ancient_at_year_boundary() {
+        assert_eq!(
+            age_bucket(commit_with_age(TEST_YEAR_SECONDS), TEST_NOW_UNIX),
+            BlameAgeBucket::Ancient
+        );
+        assert_eq!(
+            age_bucket(commit_with_age(10 * TEST_YEAR_SECONDS), TEST_NOW_UNIX),
+            BlameAgeBucket::Ancient
+        );
+    }
+
+    #[test]
+    fn test_age_bucket_future_timestamp_clamps_to_fresh() {
+        assert_eq!(
+            age_bucket(Some(TEST_NOW_UNIX + 3_600), TEST_NOW_UNIX),
+            BlameAgeBucket::Fresh
+        );
+        assert_eq!(
+            age_bucket(Some(i64::MAX), TEST_NOW_UNIX),
+            BlameAgeBucket::Fresh
+        );
+    }
+
+    #[test]
+    fn test_heatmap_tint_selected_takes_precedence_over_every_bucket() {
+        for bucket in [
+            BlameAgeBucket::Fresh,
+            BlameAgeBucket::Recent,
+            BlameAgeBucket::Old,
+            BlameAgeBucket::Ancient,
+            BlameAgeBucket::Unknown,
+        ] {
+            assert_eq!(
+                blame_heatmap_tint(bucket, true),
+                BlameHeatmapTint::Selected,
+                "selected row must keep the selection tint for bucket {bucket:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_heatmap_tint_maps_buckets_without_selection() {
+        assert_eq!(
+            blame_heatmap_tint(BlameAgeBucket::Fresh, false),
+            BlameHeatmapTint::Fresh
+        );
+        assert_eq!(
+            blame_heatmap_tint(BlameAgeBucket::Recent, false),
+            BlameHeatmapTint::Recent
+        );
+        assert_eq!(
+            blame_heatmap_tint(BlameAgeBucket::Old, false),
+            BlameHeatmapTint::Old
+        );
+        assert_eq!(
+            blame_heatmap_tint(BlameAgeBucket::Ancient, false),
+            BlameHeatmapTint::Ancient
+        );
+    }
+
+    #[test]
+    fn test_heatmap_tint_unknown_without_selection_falls_back_to_default() {
+        assert_eq!(
+            blame_heatmap_tint(BlameAgeBucket::Unknown, false),
+            BlameHeatmapTint::Default
+        );
     }
 }
