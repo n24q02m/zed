@@ -408,8 +408,7 @@ impl BlameRenderer for GitBlameRenderer {
         let hover_metadata = blame_hover_metadata(&blame);
         let hover_actions = available_blame_hover_actions(&blame);
         let blame_revision_target = blame.revision_target(None);
-        let show_blame_revision_action =
-            hover_actions.contains(&BlameHoverAction::BlameAtRevision);
+        let show_blame_revision_action = hover_actions.contains(&BlameHoverAction::BlameAtRevision);
 
         Some(
             tooltip_container(cx, |this, cx| {
@@ -824,25 +823,26 @@ fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlameHoverMetadata {
-    pub short_commit_hash: String,
-    pub author_display: String,
-    pub summary_display: String,
-    pub relative_timestamp: String,
+struct BlameHoverMetadata {
+    short_commit_hash: String,
+    author_display: String,
+    summary_display: String,
+    relative_timestamp: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlameHoverAction {
+enum BlameHoverAction {
     CopyCommitHash,
     OpenCommit,
     BlameAtRevision,
 }
 
-pub fn blame_hover_metadata(blame_entry: &BlameEntry) -> BlameHoverMetadata {
+fn blame_hover_metadata(blame_entry: &BlameEntry) -> BlameHoverMetadata {
     let short_commit_hash = blame_entry.sha.display_short();
     let author_display = match blame_entry.author.as_deref() {
         Some(author_name) if !author_name.trim().is_empty() => {
-            util::truncate_and_trailoff(author_name, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED).to_string()
+            util::truncate_and_trailoff(author_name, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED)
+                .to_string()
         }
         _ => BLAME_HOVER_MISSING_AUTHOR_DISPLAY.to_string(),
     };
@@ -869,7 +869,7 @@ pub fn blame_hover_metadata(blame_entry: &BlameEntry) -> BlameHoverMetadata {
     }
 }
 
-pub fn available_blame_hover_actions(blame_entry: &BlameEntry) -> Vec<BlameHoverAction> {
+fn available_blame_hover_actions(blame_entry: &BlameEntry) -> Vec<BlameHoverAction> {
     if blame_entry.sha.is_zero() {
         return vec![BlameHoverAction::CopyCommitHash];
     }
