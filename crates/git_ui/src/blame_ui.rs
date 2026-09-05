@@ -322,9 +322,7 @@ impl BlameRenderer for GitBlameRenderer {
                         .font(style.font())
                         .line_height(style.line_height)
                         .text_color(cx.theme().status().hint)
-                        .when_some(heatmap_background, |row, background| {
-                            row.bg(background)
-                        })
+                        .when_some(heatmap_background, |row, background| row.bg(background))
                         .child(
                             h_flex()
                                 .gap_2()
