@@ -79,7 +79,7 @@ jobs:
           # so each slice filter runs separately. A filter absent from the
           # target tree matches zero tests and exits ok; the totals below keep
           # that a fail-closed rejection, never a pass.
-          $testFilters = @("heatmap", "blame_hover")
+          $testFilters = @("heatmap", "age_bucket", "blame_hover")
           $passedTotal = 0
           $failedTotal = 0
           foreach ($testFilter in $testFilters) {
