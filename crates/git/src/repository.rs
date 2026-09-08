@@ -5582,6 +5582,80 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_initial_graph_data_selection_follows_rename(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+
+        fs::write(repo_dir.path().join("renamed-1.txt"), "alpha\nbeta\n").unwrap();
+        git_command(repo_dir.path(), ["add", "renamed-1.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "create file"]);
+        let create_sha: Oid = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+
+        git_command(repo_dir.path(), ["mv", "renamed-1.txt", "renamed-2.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "rename file"]);
+        let rename_sha: Oid = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+
+        fs::write(
+            repo_dir.path().join("renamed-2.txt"),
+            "alpha changed\nbeta\n",
+        )
+        .unwrap();
+        git_command(repo_dir.path(), ["add", "renamed-2.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "edit line"]);
+        let edit_sha: Oid = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"])
+            .parse()
+            .unwrap();
+
+        let repo = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let (request_tx, request_rx) = async_channel::unbounded();
+
+        repo.initial_graph_data(
+            LogSource::Selection {
+                path: RepoPath::new("renamed-2.txt").unwrap(),
+                start_line: 1,
+                end_line: 1,
+            },
+            LogOrder::DateOrder,
+            request_tx,
+        )
+        .await
+        .unwrap();
+
+        let graph_data = request_rx.recv().await.unwrap();
+        let commits: Vec<Oid> = graph_data.iter().map(|commit| commit.sha).collect();
+        assert_eq!(
+            commits.len(),
+            2,
+            "selection history should omit the pure rename"
+        );
+        assert!(
+            commits.contains(&create_sha),
+            "selection history should include the pre-rename commit"
+        );
+        assert!(
+            commits.contains(&edit_sha),
+            "selection history should include the post-rename edit"
+        );
+        assert!(
+            !commits.contains(&rename_sha),
+            "a pure rename should not appear in line history"
+        );
+    }
+
+    #[gpui::test]
     async fn test_initial_graph_data_selection_preserves_git_error(cx: &mut TestAppContext) {
         disable_git_global_config();
         cx.executor().allow_parking();
