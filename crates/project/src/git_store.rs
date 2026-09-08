@@ -15,7 +15,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow, bail};
 use askpass::{AskPassDelegate, EncryptedPassword, IKnowWhatIAmDoingAndIHaveReadTheDocs};
-use async_lock::{Semaphore, SemaphoreGuardArc};
+use async_lock::Semaphore;
 use buffer_diff::{BufferDiff, DiffHunk, DiffHunkSecondaryStatus, PendingHunk, PendingSense};
 use client::ProjectId;
 use collections::HashMap;
@@ -104,6 +104,8 @@ pub struct GitStore {
     repositories: HashMap<RepositoryId, Entity<Repository>>,
     parked_repositories: Vec<ParkedRepository>,
     diff_base: GitDiffBaseSetting,
+    auto_fetch_coordinator: AutoFetchCoordinator,
+    auto_fetch_config: AutoFetchConfig,
     display_diffs: HashMap<RepositoryId, DisplayDiff>,
     worktree_ids: HashMap<RepositoryId, HashSet<WorktreeId>>,
     active_repo_id: Option<RepositoryId>,
@@ -621,32 +623,95 @@ pub struct Repository {
     initial_graph_data: HashMap<(LogSource, LogOrder), InitialGitGraphData>,
     commit_data_handler: CommitDataHandlerState,
     commit_data: HashMap<Oid, CommitDataState>,
-    auto_fetch: AutoFetchState,
-    /// Held for the duration of a fetch so that at most one runs per repository.
-    /// Auto-fetch acquires it without blocking and skips its tick when a fetch is
-    /// already in flight; the manual fetch waits, so an explicit user action is
-    /// never dropped. Concurrent fetches would otherwise contend for the same
-    /// remote-tracking ref locks, and the loser fails with `cannot lock ref`.
+    auto_fetch_coordinator: AutoFetchCoordinator,
     fetch_lock: Arc<Semaphore>,
+    auto_fetch_task: Option<Task<()>>,
+    auto_fetch_config: AutoFetchConfig,
 }
 
-struct AutoFetchState {
-    enabled: bool,
-    interval_secs: u64,
-    task: Option<Task<()>>,
+type RemoteAskPassDelegates = Arc<Mutex<HashMap<u64, RemoteAskPassDelegate>>>;
+
+/// Configuration for unattended repository fetches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoFetchConfig {
+    pub enabled: bool,
+    pub interval: Duration,
+    pub deadline: Duration,
 }
 
-impl Default for AutoFetchState {
+impl Default for AutoFetchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            interval_secs: 60,
-            task: None,
+            interval: Duration::from_secs(60),
+            deadline: Duration::from_secs(30),
         }
     }
 }
 
-type RemoteAskPassDelegates = Arc<Mutex<HashMap<u64, RemoteAskPassDelegate>>>;
+fn auto_fetch_config_from_settings(cx: &App) -> AutoFetchConfig {
+    let git = &ProjectSettings::get_global(cx).git;
+    AutoFetchConfig {
+        enabled: git.auto_fetch,
+        interval: Duration::from_secs(git.auto_fetch_interval_secs),
+        deadline: Duration::from_secs(30),
+    }
+}
+
+/// Coordinates unattended fetches across worktrees that share a Git common directory.
+#[derive(Clone, Default)]
+pub struct AutoFetchCoordinator {
+    in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+/// Lease held for the duration of one automatic fetch.
+pub struct AutoFetchPermit {
+    common_dir: PathBuf,
+    in_flight: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+impl Drop for AutoFetchPermit {
+    fn drop(&mut self) {
+        self.in_flight.lock().remove(&self.common_dir);
+    }
+}
+
+impl AutoFetchCoordinator {
+    /// Reserves a common directory for an automatic fetch unless disabled or busy.
+    pub fn try_acquire(&self, common_dir: &Path, enabled: bool) -> Option<AutoFetchPermit> {
+        if !enabled {
+            return None;
+        }
+
+        let common_dir = common_dir.to_path_buf();
+        let mut in_flight = self.in_flight.lock();
+        if !in_flight.insert(common_dir.clone()) {
+            return None;
+        }
+
+        Some(AutoFetchPermit {
+            common_dir,
+            in_flight: self.in_flight.clone(),
+        })
+    }
+}
+
+/// Bounds an unattended operation with the executor's deterministic timer.
+pub async fn bounded_auto_fetch<T, F>(
+    executor: BackgroundExecutor,
+    operation: F,
+    deadline: Duration,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let timer = executor.timer(deadline);
+    futures::pin_mut!(timer, operation);
+    futures::select_biased! {
+        result = operation.fuse() => result,
+        _ = timer.fuse() => Err(anyhow!("automatic git fetch timed out")),
+    }
+}
 
 struct RemoteAskPassDelegate {
     delegate: AskPassDelegate,
@@ -766,8 +831,14 @@ pub enum RepositoryEvent {
     BranchListChanged,
     StashEntriesChanged,
     GitWorktreeListChanged,
-    PendingOpsChanged { pending_ops: SumTree<PendingOps> },
+    PendingOpsChanged {
+        pending_ops: SumTree<PendingOps>,
+    },
     GraphEvent((LogSource, LogOrder), GitGraphEvent),
+    AutoFetchFailed {
+        common_dir: Arc<Path>,
+        message: SharedString,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -930,10 +1001,15 @@ impl GitStore {
             if setting != this.diff_base {
                 this.set_diff_base(setting, cx);
             }
+            let auto_fetch_config = auto_fetch_config_from_settings(cx);
+            if auto_fetch_config != this.auto_fetch_config {
+                this.configure_auto_fetch(auto_fetch_config, cx);
+            }
             this.activate_parked_repositories_where_parking_disabled(cx);
         }));
 
         let diff_base_setting = ProjectSettings::get_global(cx).git.diff_base;
+        let auto_fetch_config = auto_fetch_config_from_settings(cx);
         GitStore {
             state,
             buffer_store,
@@ -941,6 +1017,8 @@ impl GitStore {
             repositories: HashMap::default(),
             parked_repositories: Vec::new(),
             diff_base: diff_base_setting,
+            auto_fetch_coordinator: AutoFetchCoordinator::default(),
+            auto_fetch_config,
             display_diffs: HashMap::default(),
             worktree_ids: HashMap::default(),
             active_repo_id: None,
@@ -950,6 +1028,19 @@ impl GitStore {
             diffs: HashMap::default(),
             buffer_ids_by_index_text_buffer_id: HashMap::default(),
         }
+    }
+
+    pub fn configure_auto_fetch(&mut self, config: AutoFetchConfig, cx: &mut Context<Self>) {
+        self.auto_fetch_config = config;
+        for repository in self.repositories.values() {
+            repository.update(cx, |repository, cx| {
+                repository.configure_auto_fetch(config, cx);
+            });
+        }
+    }
+
+    pub fn auto_fetch_config(&self) -> AutoFetchConfig {
+        self.auto_fetch_config
     }
 
     pub fn init(client: &AnyProtoClient) {
@@ -2763,6 +2854,8 @@ impl GitStore {
             })
             .unwrap_or(false);
 
+        let auto_fetch_coordinator = self.auto_fetch_coordinator.clone();
+        let auto_fetch_config = self.auto_fetch_config;
         let id = RepositoryId(next_repository_id.fetch_add(1, atomic::Ordering::Release));
         let git_store = cx.weak_entity();
         let repo = cx.new(|cx| {
@@ -2776,8 +2869,10 @@ impl GitStore {
                 fs,
                 is_trusted,
                 git_store,
+                auto_fetch_coordinator,
                 cx,
             );
+            repo.configure_auto_fetch(auto_fetch_config, cx);
             if let Some(updates_tx) = updates_tx.as_ref() {
                 // trigger an empty `UpdateRepository` to ensure remote active_repo_id is set correctly
                 updates_tx
@@ -6347,6 +6442,7 @@ impl Repository {
         self.snapshot.repository_dir_abs_path = repository_dir_abs_path;
         self.snapshot.common_dir_abs_path = common_dir_abs_path;
         self.respawn_local_worker(project_environment, fs, is_trusted, cx);
+        self.restart_auto_fetch_task(cx);
     }
 
     fn local(
@@ -6359,6 +6455,7 @@ impl Repository {
         fs: Arc<dyn Fs>,
         is_trusted: bool,
         git_store: WeakEntity<GitStore>,
+        auto_fetch_coordinator: AutoFetchCoordinator,
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot = RepositorySnapshot::empty(
@@ -6369,19 +6466,6 @@ impl Repository {
             Some(common_dir_abs_path),
             PathStyle::local(),
         );
-
-        cx.observe_global::<SettingsStore>(|this: &mut Self, cx| {
-            this.restart_auto_fetch_timer(cx);
-        })
-        .detach();
-
-        let weak = cx.weak_entity();
-        cx.defer(move |cx| {
-            weak.update(cx, |this, cx| {
-                this.restart_auto_fetch_timer(cx);
-            })
-            .ok();
-        });
 
         let mut repo = Repository {
             this: cx.weak_entity(),
@@ -6401,7 +6485,9 @@ impl Repository {
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
-            auto_fetch: AutoFetchState::default(),
+            auto_fetch_coordinator,
+            auto_fetch_task: None,
+            auto_fetch_config: AutoFetchConfig::default(),
             fetch_lock: Arc::new(Semaphore::new(1)),
         };
         repo.respawn_local_worker(project_environment, fs, is_trusted, cx);
@@ -6452,7 +6538,9 @@ impl Repository {
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
-            auto_fetch: AutoFetchState::default(),
+            auto_fetch_coordinator: AutoFetchCoordinator::default(),
+            auto_fetch_task: None,
+            auto_fetch_config: AutoFetchConfig::default(),
             fetch_lock: Arc::new(Semaphore::new(1)),
         }
     }
@@ -8467,89 +8555,92 @@ impl Repository {
         Ok(())
     }
 
-    fn restart_auto_fetch_timer(&mut self, cx: &mut Context<Self>) {
-        let git_settings = &ProjectSettings::get_global(cx).git;
-        let enabled = git_settings.auto_fetch;
-        let interval_secs = git_settings.auto_fetch_interval_secs;
-
-        if self.auto_fetch.enabled == enabled && self.auto_fetch.interval_secs == interval_secs {
+    pub fn configure_auto_fetch(&mut self, config: AutoFetchConfig, cx: &mut Context<Self>) {
+        if self.auto_fetch_config == config {
             return;
         }
 
-        self.auto_fetch.enabled = enabled;
-        self.auto_fetch.interval_secs = interval_secs;
+        self.auto_fetch_config = config;
+        self.restart_auto_fetch_task(cx);
+    }
 
-        if !enabled {
-            self.auto_fetch.task = None;
+    fn restart_auto_fetch_task(&mut self, cx: &mut Context<Self>) {
+        self.auto_fetch_task = None;
+        let config = self.auto_fetch_config;
+        if !config.enabled {
             return;
         }
 
-        let interval = Duration::from_secs(interval_secs);
-
-        self.auto_fetch.task = Some(cx.spawn(async move |this, cx| {
+        let this = cx.weak_entity();
+        let common_dir = self.snapshot.common_dir_abs_path.clone();
+        let coordinator = self.auto_fetch_coordinator.clone();
+        self.auto_fetch_task = Some(cx.spawn(async move |_, cx| {
             loop {
-                cx.background_executor().timer(interval).await;
-                // Re-checked every tick rather than once up front, because a
-                // repository can be trusted (or restricted) at any point in the
-                // session.
-                let Ok(fetch) = this.update(cx, |this, cx| {
-                    if !this.is_trusted() {
+                cx.background_executor().timer(config.interval).await;
+                let fetch = this.update(cx, |repository, cx| {
+                    if !repository.is_trusted() {
                         return None;
                     }
-                    // Skipped rather than queued: a fetch is already in flight, so
-                    // waiting would only contend for the same ref locks to learn
-                    // what that fetch is about to report anyway.
-                    let permit = this.fetch_lock.clone().try_acquire_arc()?;
-                    Some(this.auto_fetch(permit, cx))
-                }) else {
+                    let permit = coordinator.try_acquire(&common_dir, true)?;
+                    Some(repository.start_auto_fetch_once(permit, config.deadline, cx))
+                });
+                let Ok(fetch) = fetch else {
                     break;
                 };
                 let Some(fetch) = fetch else {
                     continue;
                 };
+
                 if let Err(error) = fetch.await {
-                    log::debug!("auto-fetch failed: {error:#}");
+                    let _ = this.update(cx, |_, cx| {
+                        cx.emit(RepositoryEvent::AutoFetchFailed {
+                            common_dir: common_dir.clone(),
+                            message: format!("automatic git fetch failed: {error:#}").into(),
+                        });
+                    });
                 }
             }
         }));
     }
 
-    /// Runs outside the repository's serial job queue, unlike every other git
-    /// operation. A fetch is bounded by the network, not by local work, so
-    /// occupying the queue for its duration would stall status refreshes and
-    /// index writes (staging) behind it once per interval. Doing so is safe
-    /// specifically because auto-fetch mutates no `Repository` state: it only
-    /// downloads objects and updates remote-tracking refs, which git guards with
-    /// its own lockfiles, and the results reach the UI when the resulting git
-    /// directory change triggers a rescan.
-    ///
-    /// The manual `fetch` deliberately stays on the queue, since it also writes
-    /// snapshot state via `refresh_branch_list`.
-    fn auto_fetch(
+    fn start_auto_fetch_once(
         &mut self,
-        permit: SemaphoreGuardArc,
+        permit: AutoFetchPermit,
+        deadline: Duration,
         cx: &mut Context<Self>,
     ) -> Task<Result<RemoteCommandOutput>> {
         let repository_state = self.repository_state.clone();
-        cx.spawn(async move |_, cx| {
-            // Moved into the task so the permit is released once the fetch settles,
-            // including when the task is dropped mid-flight.
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |_, mut cx| {
             let _permit = permit;
-            let state = repository_state.await.map_err(|error| anyhow!(error))?;
-            // Callers gate on `Repository::is_trusted`, which only ever reports
-            // true for local repositories.
-            let RepositoryState::Local(LocalRepositoryState {
-                backend,
-                environment,
-                ..
-            }) = state
-            else {
-                anyhow::bail!("auto-fetch is only supported for local repositories");
-            };
-            let askpass = AskPassDelegate::no_op(cx);
-            backend
-                .fetch(FetchOptions::All, askpass, environment, cx.clone())
-                .await
+            bounded_auto_fetch(
+                executor,
+                async {
+                    let state = repository_state.await.map_err(|error| anyhow!(error))?;
+                    let RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) = state
+                    else {
+                        bail!("automatic git fetch is only supported for local repositories");
+                    };
+
+                    let mut environment = (*environment).clone();
+                    environment.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+                    let askpass = AskPassDelegate::new(&mut cx, |_, response, _| drop(response));
+                    backend
+                        .fetch(
+                            FetchOptions::All,
+                            askpass,
+                            Arc::new(environment),
+                            cx.clone(),
+                        )
+                        .await
+                },
+                deadline,
+            )
+            .await
         })
     }
 
