@@ -168,7 +168,15 @@ impl BlameRenderer for GitBlameRenderer {
         let short_commit_id = blame_entry.sha.display_short();
         let author_name = blame_entry.author.as_deref().unwrap_or("<no name>");
         let name = util::truncate_and_trailoff(author_name, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED);
-        let age_background = blame_entry_age_background(&blame_entry, sha_color, cx);
+        let is_highlighted = editor
+            .read(cx)
+            .blame()
+            .is_some_and(|blame| blame.read(cx).highlighted_sha() == Some(blame_entry.sha));
+        let background = blame_entry_background(
+            is_highlighted,
+            blame_entry_age_background(&blame_entry, sha_color, cx),
+            cx.theme().colors().element_selected,
+        );
 
         let avatar = if ProjectSettings::get_global(cx).git.blame.show_avatar {
             let author_email = blame_entry.author_mail.as_ref().map(|email| {
@@ -204,7 +212,7 @@ impl BlameRenderer for GitBlameRenderer {
                         .font(style.font())
                         .line_height(style.line_height)
                         .text_color(cx.theme().status().hint)
-                        .when_some(age_background, |this, background| this.bg(background))
+                        .when_some(background, |this, background| this.bg(background))
                         .child(
                             h_flex()
                                 .gap_2()
@@ -539,6 +547,18 @@ impl BlameRenderer for GitBlameRenderer {
     }
 }
 
+fn blame_entry_background(
+    is_highlighted: bool,
+    age_background: Option<Hsla>,
+    selected_background: Hsla,
+) -> Option<Hsla> {
+    if is_highlighted {
+        Some(selected_background)
+    } else {
+        age_background
+    }
+}
+
 fn blame_entry_age_background(blame_entry: &BlameEntry, sha_color: Hsla, cx: &App) -> Option<Hsla> {
     let age_coloring = ProjectSettings::get_global(cx).git.blame.age_coloring;
     if age_coloring == BlameAgeColoring::None {
@@ -816,17 +836,46 @@ fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::blame_age_alpha;
+    use super::{blame_age_alpha, blame_entry_background};
+    use gpui::Hsla;
 
     #[test]
-    fn blame_age_alpha_decreases_with_age() {
-        let one_hour = 60 * 60;
-        let two_days = 2 * 24 * 60 * 60;
-        let two_weeks = 14 * 24 * 60 * 60;
-        let two_years = 2 * 365 * 24 * 60 * 60;
+    fn blame_background_prefers_selected_row() {
+        let selected_background = Hsla::red();
+        let age_background = Some(Hsla::blue());
 
-        assert!(blame_age_alpha(one_hour) > blame_age_alpha(two_days));
-        assert!(blame_age_alpha(two_days) > blame_age_alpha(two_weeks));
-        assert!(blame_age_alpha(two_weeks) > blame_age_alpha(two_years));
+        assert_eq!(
+            blame_entry_background(true, age_background, selected_background),
+            Some(selected_background)
+        );
+        assert_eq!(
+            blame_entry_background(false, age_background, selected_background),
+            age_background
+        );
+        assert_eq!(
+            blame_entry_background(false, None, selected_background),
+            None
+        );
+    }
+
+    #[test]
+    fn blame_age_alpha_covers_bucket_boundaries_and_future_timestamps() {
+        let hour = 60 * 60;
+        let day = 24 * hour;
+        let week = 7 * day;
+        let month = 30 * day;
+        let quarter = 3 * month;
+        let half_year = 6 * month;
+        let year = 365 * day;
+
+        assert_eq!(blame_age_alpha(-1), 1.0);
+        assert_eq!(blame_age_alpha(hour - 1), 1.0);
+        assert_eq!(blame_age_alpha(hour), 0.9);
+        assert_eq!(blame_age_alpha(day), 0.75);
+        assert_eq!(blame_age_alpha(week), 0.6);
+        assert_eq!(blame_age_alpha(month), 0.45);
+        assert_eq!(blame_age_alpha(quarter), 0.3);
+        assert_eq!(blame_age_alpha(half_year), 0.15);
+        assert_eq!(blame_age_alpha(year), 0.0);
     }
 }

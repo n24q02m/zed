@@ -725,7 +725,7 @@ impl Settings for ProjectSettings {
                 let blame = git.blame.unwrap();
                 BlameSettings {
                     show_avatar: blame.show_avatar.unwrap(),
-                    age_coloring: blame.age_coloring.unwrap().into(),
+                    age_coloring: blame.age_coloring.unwrap_or_default().into(),
                 }
             },
             branch_picker: {
