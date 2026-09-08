@@ -1,4 +1,4 @@
-# Fork-only verifier: compile and run the immutable slice's own Git UI tests.
+# Fork-only verifier: compile and run an explicit test filter on an immutable source.
 # Separate trigger ref (verify/git-ui-targeted-test) so repairing test
 # selection never launches duplicate Windows bundles on
 # verify/windows-ui-smoke.
@@ -33,11 +33,13 @@ jobs:
         id: target
         shell: pwsh
         run: |
-          $expected = (git log -1 --format=%s).Trim().ToLowerInvariant()
-          if ($expected -notmatch "^[0-9a-f]{40}$") {
-            throw "push verifier commits must use the target SHA as their subject"
+          $request = (git log -1 --format=%s).Trim()
+          if ($request -cnotmatch "^([0-9a-f]{40}) (git|git_ui|project) ([a-zA-Z0-9_:]+)$") {
+            throw "push verifier subject must be: <full SHA> <git|git_ui|project> <test filter>"
           }
-          "sha=$expected" >> $env:GITHUB_OUTPUT
+          "sha=$($Matches[1])" >> $env:GITHUB_OUTPUT
+          "package=$($Matches[2])" >> $env:GITHUB_OUTPUT
+          "filter=$($Matches[3])" >> $env:GITHUB_OUTPUT
 
       - name: Check out requested fork commit
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -57,9 +59,12 @@ jobs:
             throw "checked out $actual, expected $expected"
           }
 
-      - name: Run slice Git UI tests
+      - name: Run requested source tests
         shell: pwsh
         working-directory: source
+        env:
+          TEST_PACKAGE: ${{ steps.target.outputs.package }}
+          TEST_FILTER: ${{ steps.target.outputs.filter }}
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
           $vsInstall = (& $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath | Select-Object -First 1 | Out-String).Trim()
@@ -75,34 +80,17 @@ jobs:
           # dependency fixture within Windows MAX_PATH. Keep only Cargo's cache
           # at this short job-local root; rustup remains at the runner default.
           New-Item -ItemType Directory -Force $env:CARGO_HOME | Out-Null
-          # One filter per slice: the pinned cargo accepts a single TESTNAME,
-          # so each slice filter runs separately. A filter absent from the
-          # target tree matches zero tests and exits ok; the totals below keep
-          # that a fail-closed rejection, never a pass.
-          $testFilters = @("heatmap", "age_bucket", "blame_hover")
-          $passedTotal = 0
-          $failedTotal = 0
-          foreach ($testFilter in $testFilters) {
-            $testLog = Join-Path $env:RUNNER_TEMP "fork-git-ui-targeted-test-slices-$testFilter.log"
-            & cargo --color never test -p git_ui --lib $testFilter -- 2>&1 | Tee-Object -FilePath $testLog
-            if ($LASTEXITCODE -ne 0) {
-              throw "slice Git UI tests ($testFilter) failed with cargo exit code $LASTEXITCODE"
-            }
-            $filterOutput = Get-Content -Raw $testLog
-            $resultMatches = [regex]::Matches($filterOutput, "test result: ok\. (\d+) passed; (\d+) failed;")
-            if ($resultMatches.Count -lt 1) {
-              throw "slice Git UI tests ($testFilter) reported no ok result line: $filterOutput"
-            }
-            foreach ($resultMatch in $resultMatches) {
-              $passedTotal += [int]$resultMatch.Groups[1].Value
-              $failedTotal += [int]$resultMatch.Groups[2].Value
-            }
+          # Cargo succeeds when a filter matches nothing. Require a real,
+          # successful result for this exact requested filter, not a sibling.
+          $testLog = Join-Path $env:RUNNER_TEMP "fork-targeted-source-test.log"
+          & cargo --color never test -p $env:TEST_PACKAGE --lib $env:TEST_FILTER -- 2>&1 | Tee-Object -FilePath $testLog
+          if ($LASTEXITCODE -ne 0) {
+            throw "requested source tests failed with cargo exit code $LASTEXITCODE"
           }
-          if ($failedTotal -ne 0) {
-            throw "slice Git UI tests reported $failedTotal failures"
-          }
-          if ($passedTotal -lt 1) {
-            throw "slice Git UI tests executed zero tests (filters matched nothing)"
+          $testOutput = Get-Content -Raw $testLog
+          $resultMatches = [regex]::Matches($testOutput, "test result: ok\. (\d+) passed; (\d+) failed;")
+          if ($resultMatches.Count -ne 1 -or [int]$resultMatches[0].Groups[1].Value -lt 1 -or [int]$resultMatches[0].Groups[2].Value -ne 0) {
+            throw "requested test filter must execute at least one passing test and zero failing tests"
           }
           cargo fmt --all -- --check
           if ($LASTEXITCODE -ne 0) {
