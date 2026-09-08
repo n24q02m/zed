@@ -407,7 +407,7 @@ impl BlameRenderer for GitBlameRenderer {
             .flatten();
         let hover_metadata = blame_hover_metadata(&blame);
         let hover_actions = available_blame_hover_actions(&blame);
-        let blame_revision_target = blame.revision_target(None);
+        let blame_revision_target = blame_hover_revision_target(&blame);
         let show_blame_revision_action = hover_actions.contains(&BlameHoverAction::BlameAtRevision);
         let blame_revision_repository = repository.clone();
         let blame_revision_workspace = workspace.clone();
@@ -873,6 +873,12 @@ fn blame_hover_metadata(blame_entry: &BlameEntry) -> BlameHoverMetadata {
     }
 }
 
+fn blame_hover_revision_target(blame_entry: &BlameEntry) -> Option<(Oid, RepoPath)> {
+    blame_entry
+        .revision_target(None)
+        .or_else(|| blame_entry.previous_revision_target())
+}
+
 fn available_blame_hover_actions(blame_entry: &BlameEntry) -> Vec<BlameHoverAction> {
     if blame_entry.sha.is_zero() {
         return vec![BlameHoverAction::CopyCommitHash];
@@ -950,5 +956,22 @@ mod blame_hover_tests {
         assert!(hover_actions.contains(&BlameHoverAction::OpenCommit));
         assert!(hover_actions.contains(&BlameHoverAction::BlameAtRevision));
         assert_eq!(hover_actions.len(), 3);
+    }
+
+    #[test]
+    fn blame_hover_revision_target_falls_back_to_previous_revision() {
+        let mut blame_entry = full_hover_blame_entry();
+        let previous_sha: Oid = "def4567000000000000000000000000000000000"
+            .parse()
+            .expect("valid previous commit hash");
+        blame_entry.sha = "0000000000000000000000000000000000000000"
+            .parse()
+            .expect("valid zero commit hash");
+        blame_entry.previous = Some(format!("{previous_sha} src/old.rs"));
+
+        assert_eq!(
+            blame_hover_revision_target(&blame_entry),
+            Some((previous_sha, RepoPath::new("src/old.rs").unwrap()))
+        );
     }
 }
