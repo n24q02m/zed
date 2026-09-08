@@ -3752,7 +3752,7 @@ impl GitPanel {
             };
         }
 
-        let selected_paths = selected_paths
+        let selected_paths: Vec<_> = selected_paths
             .into_iter()
             .unique_by(|(repository_id, path)| (*repository_id, path.clone()))
             .collect();
