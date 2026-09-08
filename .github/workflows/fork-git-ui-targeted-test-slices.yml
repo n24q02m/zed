@@ -83,7 +83,11 @@ jobs:
           # Cargo succeeds when a filter matches nothing. Require a real,
           # successful result for this exact requested filter, not a sibling.
           $testLog = Join-Path $env:RUNNER_TEMP "fork-targeted-source-test.log"
-          & cargo --color never test -p $env:TEST_PACKAGE --lib $env:TEST_FILTER -- 2>&1 | Tee-Object -FilePath $testLog
+          if ($env:TEST_PACKAGE -eq "project" -and $env:TEST_FILTER -eq "test_auto_fetch") {
+            & cargo --color never test -p $env:TEST_PACKAGE --test git_store $env:TEST_FILTER -- 2>&1 | Tee-Object -FilePath $testLog
+          } else {
+            & cargo --color never test -p $env:TEST_PACKAGE --lib $env:TEST_FILTER -- 2>&1 | Tee-Object -FilePath $testLog
+          }
           if ($LASTEXITCODE -ne 0) {
             throw "requested source tests failed with cargo exit code $LASTEXITCODE"
           }
