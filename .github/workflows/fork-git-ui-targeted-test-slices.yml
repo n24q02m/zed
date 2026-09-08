@@ -83,7 +83,9 @@ jobs:
           # Cargo succeeds when a filter matches nothing. Require a real,
           # successful result for this exact requested filter, not a sibling.
           $testLog = Join-Path $env:RUNNER_TEMP "fork-targeted-source-test.log"
-          if ($env:TEST_PACKAGE -eq "project" -and $env:TEST_FILTER -eq "test_auto_fetch") {
+          # Project auto-fetch behavior tests live in the `integration' test target
+          # (crates/project/tests/integration/git_store.rs), not in --lib.
+          if ($env:TEST_PACKAGE -eq "project" -and $env:TEST_FILTER -like "*auto_fetch*") {
             & cargo --color never test -p $env:TEST_PACKAGE --test integration $env:TEST_FILTER -- 2>&1 | Tee-Object -FilePath $testLog
           } else {
             & cargo --color never test -p $env:TEST_PACKAGE --lib $env:TEST_FILTER -- 2>&1 | Tee-Object -FilePath $testLog
