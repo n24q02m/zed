@@ -11862,7 +11862,10 @@ mod tests {
         cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
                 store.update_user_settings(cx, |settings| {
-                    settings.git_panel.get_or_insert_default().show_all_repositories = Some(true);
+                    settings
+                        .git_panel
+                        .get_or_insert_default()
+                        .show_all_repositories = Some(true);
                 });
             });
         });
@@ -11896,7 +11899,11 @@ mod tests {
             cx.run_until_parked();
             panel.read_with(&cx, |panel, _| {
                 assert_eq!(
-                    panel.commit_history_entries().iter().map(|entry| entry.sha).collect::<Vec<_>>(),
+                    panel
+                        .commit_history_entries()
+                        .iter()
+                        .map(|entry| entry.sha)
+                        .collect::<Vec<_>>(),
                     vec![sha],
                 );
             });
@@ -11993,7 +12000,6 @@ mod tests {
             assert!(matches!(panel.commit_history, CommitHistory::Error(_)));
         });
     }
-
 
     #[test]
     fn test_commit_history_from_response() {
