@@ -808,6 +808,7 @@ struct GitRepositoryHeaderEntry {
     repository_id: RepositoryId,
     display_name: SharedString,
     work_directory: SharedString,
+    unavailable: bool,
     branch_label: SharedString,
     kind: GitRepositoryKind,
     parent_display_name: Option<SharedString>,
@@ -1363,6 +1364,8 @@ pub struct GitPanel {
     /// are never persisted across workspace/worktree switches.
     entry_repository_ids: Vec<RepositoryId>,
     repository_entry_ranges: HashMap<RepositoryId, Range<usize>>,
+    unavailable_repositories: HashSet<RepositoryId>,
+    repository_availability_task: Option<Task<()>>,
     project_repositories_expanded: bool,
     project_repository_depths: HashMap<RepositoryId, usize>,
     collapsed_repositories: HashSet<RepositoryId>,
@@ -1414,6 +1417,7 @@ pub struct GitPanel {
     active_tab: GitPanelTab,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history: CommitHistory,
+    commit_history_repository_id: Option<RepositoryId>,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
     _commit_message_buffer_subscription: Option<Subscription>,
@@ -1694,6 +1698,8 @@ impl GitPanel {
                 collapsed_repositories: HashSet::default(),
                 collapsed_sections_by_repository: HashSet::default(),
                 collapsed_sections: HashSet::default(),
+                unavailable_repositories: HashSet::default(),
+                repository_availability_task: None,
                 view_mode: GitPanelViewMode::from_settings(cx),
                 tree_expanded_dirs: HashMap::default(),
                 projected_entries_by_path: HashMap::default(),
@@ -1738,6 +1744,7 @@ impl GitPanel {
                 active_tab: GitPanelTab::Changes,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history: CommitHistory::Loading,
+                commit_history_repository_id: None,
                 focused_history_entry: None,
                 history_keyboard_nav: false,
                 _commit_message_buffer_subscription: None,
@@ -1808,13 +1815,20 @@ impl GitPanel {
     }
 
     fn activate_repository(&self, repository_id: RepositoryId, cx: &mut App) {
+        if self.unavailable_repositories.contains(&repository_id) {
+            return;
+        }
         if let Some(repository) = self.repository_for_id(repository_id, cx) {
             repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
         }
     }
 
     fn repository_for_entry_index(&self, ix: usize, cx: &App) -> Option<Entity<Repository>> {
-        self.repository_for_id(self.repository_id_for_entry_index(ix)?, cx)
+        let repository_id = self.repository_id_for_entry_index(ix)?;
+        if self.unavailable_repositories.contains(&repository_id) {
+            return None;
+        }
+        self.repository_for_id(repository_id, cx)
     }
 
     fn action_repository(&self, cx: &App) -> Option<Entity<Repository>> {
@@ -1824,9 +1838,15 @@ impl GitPanel {
             // A selected row without a live repository is unavailable. Falling
             // back to the active repository here would apply a global action to
             // the wrong repository after an all-repositories refresh.
-            return self.repository_for_entry_index(selected_entry, cx);
+            let repository_id = self.repository_id_for_entry_index(selected_entry)?;
+            if self.unavailable_repositories.contains(&repository_id) {
+                return None;
+            }
+            return self.repository_for_id(repository_id, cx);
         }
-        self.active_repository.clone()
+        let repository = self.active_repository.clone()?;
+        let repository_id = repository.read(cx).id;
+        (!self.unavailable_repositories.contains(&repository_id)).then_some(repository)
     }
 
     fn repository_local_entry_index(
@@ -2031,7 +2051,7 @@ impl GitPanel {
             return;
         };
 
-        self.selected_entry = Some(ix);
+        self.set_selected_entry_index(ix);
         self.scroll_to_selected_entry(cx);
     }
 
@@ -2364,7 +2384,7 @@ impl GitPanel {
         self.toggle_directory(&directory_key, window, cx);
 
         if let Some(index) = self.directory_entry_index(&directory_key) {
-            self.selected_entry = Some(index);
+            self.set_selected_entry_index(index);
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -2394,7 +2414,7 @@ impl GitPanel {
         };
 
         if let Some(first_entry) = first_entry {
-            self.selected_entry = Some(first_entry);
+            self.set_selected_entry_index(first_entry);
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -2439,7 +2459,7 @@ impl GitPanel {
             return;
         };
 
-        self.selected_entry = Some(candidate);
+        self.set_selected_entry_index(candidate);
         self.scroll_to_selected_entry(cx);
     }
 
@@ -2477,7 +2497,7 @@ impl GitPanel {
             return;
         };
 
-        self.selected_entry = Some(candidate);
+        self.set_selected_entry_index(candidate);
         self.scroll_to_selected_entry(cx);
     }
 
@@ -2494,7 +2514,7 @@ impl GitPanel {
             });
 
         if let Some(last_entry) = last_entry {
-            self.selected_entry = Some(last_entry);
+            self.set_selected_entry_index(last_entry);
             self.scroll_to_selected_entry(cx);
         }
     }
@@ -2636,6 +2656,23 @@ impl GitPanel {
             .map(Vec::as_slice)
     }
 
+    fn stash_paths_for_entry(&self, index: usize) -> Vec<(RepositoryId, RepoPath)> {
+        let Some(repository_id) = self.repository_id_for_entry_index(index) else {
+            return Vec::new();
+        };
+
+        if let Some(descendants) = self.directory_descendants(index) {
+            descendants
+                .iter()
+                .map(|entry| (repository_id, entry.repo_path.clone()))
+                .collect()
+        } else if let Some(entry) = self.entries.get(index).and_then(GitListEntry::status_entry) {
+            vec![(repository_id, entry.repo_path.clone())]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Returns the list of entries that are children of the directory where the
     /// context menu is deployed, if deployed.
     fn directory_context_descendants(&self) -> Option<&[GitStatusEntry]> {
@@ -2680,6 +2717,9 @@ impl GitPanel {
                 return;
             }
             GitListEntry::RepositoryHeader(entry) => {
+                if entry.unavailable {
+                    return;
+                }
                 self.activate_repository(entry.repository_id, cx);
                 return;
             }
@@ -3625,7 +3665,7 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_repository.is_none() {
+        if self.action_repository(cx).is_none() {
             return;
         }
         // `git::StashAll` is also registered on the workspace, which dispatches it while
@@ -3643,13 +3683,13 @@ impl GitPanel {
     }
 
     fn perform_stash(&mut self, kind: StashKind, message: Option<String>, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
+        let Some(action_repository) = self.action_repository(cx) else {
             return;
         };
 
         cx.spawn({
             async move |this, cx| {
-                let stash_task = active_repository
+                let stash_task = action_repository
                     .update(cx, |repo, cx| match kind {
                         StashKind::All => repo.stash_all(message, cx),
                         StashKind::Tracked => repo.stash_tracked(message, cx),
@@ -3680,35 +3720,42 @@ impl GitPanel {
             );
             return;
         };
-        let repository_id = action_repository.read(cx).id;
-        let selected_paths: Vec<_> =
-            if let Some(GitListEntry::Directory(entry)) = self.entries.get(selected_index) {
-                self.view_mode
-                    .tree_state()
-                    .and_then(|state| state.directory_descendants.get(&entry.key))
-                    .map(|descendants| {
-                        descendants
-                            .iter()
-                            .map(|entry| (repository_id, entry.repo_path.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else if let Some(entry) = self
-                .entries
-                .get(selected_index)
-                .and_then(GitListEntry::status_entry)
-            {
-                vec![(repository_id, entry.repo_path.clone())]
-            } else if let Some(GitListEntry::Header(section)) = self.entries.get(selected_index) {
-                let repo = action_repository.read(cx);
-                self.change_entries_by_path()
-                    .filter(|entry| section.contains(entry, &repo))
-                    .map(|entry| (repository_id, entry.repo_path.clone()))
-                    .collect()
-            } else {
-                Vec::new()
-            };
 
+        let repository_id = action_repository.read(cx).id;
+        let mut selected_paths = Vec::new();
+        let selected_is_marked = self
+            .selected_entry_id
+            .as_ref()
+            .is_some_and(|selected| self.marked_entries.contains(selected));
+
+        if selected_is_marked {
+            for marked in &self.marked_entries {
+                let Some(index) = self.entries.iter().enumerate().find_map(|(index, _)| {
+                    (self.entry_identity(index).as_ref() == Some(marked)).then_some(index)
+                }) else {
+                    continue;
+                };
+                selected_paths.extend(self.stash_paths_for_entry(index));
+            }
+        }
+
+        if selected_paths.is_empty() {
+            selected_paths = match self.entries.get(selected_index) {
+                Some(GitListEntry::Header(section)) => {
+                    let repo = action_repository.read(cx);
+                    self.change_entries_for_repository(repository_id)
+                        .filter(|entry| section.contains(entry, &repo))
+                        .map(|entry| (repository_id, entry.repo_path.clone()))
+                        .collect()
+                }
+                _ => self.stash_paths_for_entry(selected_index),
+            };
+        }
+
+        let selected_paths = selected_paths
+            .into_iter()
+            .unique_by(|(repository_id, path)| (*repository_id, path.clone()))
+            .collect();
         let paths = match validate_selected_stash_paths(repository_id, selected_paths) {
             Ok(paths) => paths,
             Err(error) => {
@@ -5563,6 +5610,39 @@ impl GitPanel {
         message.push('\n');
     }
 
+    fn schedule_repository_availability_check(
+        &mut self,
+        repository_paths: Vec<(RepositoryId, Arc<Path>)>,
+        is_local_project: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !is_local_project {
+            self.unavailable_repositories.clear();
+            self.repository_availability_task.take();
+            return;
+        }
+
+        let fs = self.fs.clone();
+        let this = cx.entity().downgrade();
+        self.repository_availability_task = Some(cx.spawn_in(window, async move |_, cx| {
+            let mut unavailable_repositories = HashSet::default();
+            for (repository_id, path) in repository_paths {
+                if !fs.is_dir(path.as_ref()).await {
+                    unavailable_repositories.insert(repository_id);
+                }
+            }
+
+            this.update_in(cx, |this, window, cx| {
+                if this.unavailable_repositories != unavailable_repositories {
+                    this.unavailable_repositories = unavailable_repositories;
+                    this.update_visible_entries(window, cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
     fn schedule_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = cx.entity().downgrade();
         let new_active_repository = self.project.read(cx).active_repository(cx);
@@ -5791,6 +5871,7 @@ impl GitPanel {
         let group_by_file_status = group_by == GitPanelGroupBy::Status;
         let group_by_staging_state = group_by == GitPanelGroupBy::Staging;
         let show_all_repositories = settings.show_all_repositories;
+        let is_local_project = self.project.read(cx).is_local();
 
         if let Some(active_repo) = self.active_repository.as_ref() {
             if self.git_access.is_none() {
@@ -5821,12 +5902,21 @@ impl GitPanel {
 
         let Some(active_repository) = self.active_repository.clone() else {
             // Just clear entries if no repository is active.
+            self.unavailable_repositories.clear();
+            self.repository_availability_task.take();
             cx.notify();
             return;
         };
         let active_repository_id = active_repository.read(cx).id;
         self.active_repository_id = Some(active_repository_id);
-        self.stash_entries = active_repository.read(cx).cached_stash();
+        self.stash_entries = if self
+            .unavailable_repositories
+            .contains(&active_repository_id)
+        {
+            Default::default()
+        } else {
+            active_repository.read(cx).cached_stash()
+        };
 
         let git_store = self.project.read(cx).git_store().clone();
         let mut repositories = if show_all_repositories {
@@ -5839,6 +5929,14 @@ impl GitPanel {
         } else {
             vec![active_repository.clone()]
         };
+        let repository_paths = repositories
+            .iter()
+            .map(|repository| {
+                let repository = repository.read(cx);
+                (repository.id, repository.work_directory_abs_path.clone())
+            })
+            .collect::<Vec<_>>();
+        self.schedule_repository_availability_check(repository_paths, is_local_project, window, cx);
         let root_repositories = if show_all_repositories {
             git_ui_core::worktree_service::classify_worktrees(self.project.read(cx), cx).0
         } else {
@@ -6026,6 +6124,7 @@ impl GitPanel {
             let repo = repository.read(cx);
             let repository_id = repo.id;
             let project_repository_depth = self.project_repository_depth(repository_id);
+            let repository_is_available = !self.unavailable_repositories.contains(&repository_id);
             let is_project_repository = project_repository_depth > 0;
             let repository_is_visible =
                 !is_project_repository || self.project_repositories_expanded;
@@ -6061,7 +6160,11 @@ impl GitPanel {
             let mut staged_count = 0;
             let mut repository_change_count = 0;
 
-            for status_entry in repo.cached_status() {
+            for status_entry in repo.cached_status().take(if repository_is_available {
+                usize::MAX
+            } else {
+                0
+            }) {
                 let is_conflict =
                     repo.had_conflict_on_last_merge_head_change(&status_entry.repo_path);
                 let is_new = status_entry.status.is_created();
@@ -6202,20 +6305,23 @@ impl GitPanel {
                     .get(&repository_id)
                     .and_then(|parent_id| repository_by_id.get(parent_id))
                     .map(|parent| parent.read(cx).display_name());
-                let branch_label = repo
-                    .branch
-                    .as_ref()
-                    .map(|branch| branch.name().to_owned())
-                    .or_else(|| {
-                        repo.head_commit.as_ref().map(|commit| {
-                            commit
-                                .sha
-                                .chars()
-                                .take(MAX_SHORT_SHA_LEN)
-                                .collect::<String>()
+                let branch_label = if repository_is_available {
+                    repo.branch
+                        .as_ref()
+                        .map(|branch| branch.name().to_owned())
+                        .or_else(|| {
+                            repo.head_commit.as_ref().map(|commit| {
+                                commit
+                                    .sha
+                                    .chars()
+                                    .take(MAX_SHORT_SHA_LEN)
+                                    .collect::<String>()
+                            })
                         })
-                    })
-                    .unwrap_or_else(|| "(no branch)".to_owned());
+                        .unwrap_or_else(|| "(no branch)".to_owned())
+                } else {
+                    "(unavailable)".to_owned()
+                };
                 push_entry(
                     self,
                     repository_id,
@@ -6228,6 +6334,7 @@ impl GitPanel {
                             .into_owned()
                             .into(),
                         branch_label: branch_label.into(),
+                        unavailable: !repository_is_available,
                         kind,
                         parent_display_name,
                         change_count: repository_change_count,
@@ -7866,7 +7973,7 @@ impl GitPanel {
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex().flex_1().size_full().overflow_hidden().map(|this| {
-            let has_repo = self.active_repository.is_some();
+            let has_repo = self.action_repository(cx).is_some();
             match &self.commit_history {
                 _ if !has_repo => {
                     this.child(Self::render_history_placeholder("No repository found"))
@@ -7941,12 +8048,12 @@ impl GitPanel {
         let Some(entry) = self.commit_history_entries().get(index) else {
             return;
         };
-        let Some(active_repository) = self.active_repository.as_ref() else {
+        let Some(repository) = self.action_repository(cx) else {
             return;
         };
         CommitView::open(
             entry.sha.to_string(),
-            active_repository.downgrade(),
+            repository.downgrade(),
             self.workspace.clone(),
             None,
             None,
@@ -7965,7 +8072,7 @@ impl GitPanel {
         let Some(commit) = self.commit_history_entries().get(index).cloned() else {
             return;
         };
-        let Some(repository) = self.active_repository.as_ref() else {
+        let Some(repository) = self.action_repository(cx) else {
             return;
         };
         let context_menu = commit_context_menu(
@@ -8023,40 +8130,48 @@ impl GitPanel {
     }
 
     fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.as_ref() else {
+        let Some(repository) = self.action_repository(cx) else {
             return;
         };
 
-        let Some(log_source) = Self::commit_history_log_source(active_repository, cx) else {
+        let Some(log_source) = Self::commit_history_log_source(&repository, cx) else {
             return;
         };
         let log_order = LogOrder::DateOrder;
 
         // Kick off the git log fetch so data is ready when the user switches to History.
         // graph_data() is idempotent — if already loading/loaded, this is a no-op.
-        active_repository.update(cx, |repository, cx| {
+        repository.update(cx, |repository, cx| {
             repository.graph_data(log_source, log_order, 0..0, cx);
         });
     }
 
     fn load_commit_history(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
+        let Some(repository) = self.action_repository(cx) else {
+            self._repo_subscriptions.clear();
+            self.commit_history_repository_id = None;
+            self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
             return;
         };
 
+        let repository_id = Some(repository.read(cx).id);
+        if self.commit_history_repository_id != repository_id {
+            self._repo_subscriptions.clear();
+            self.commit_history_repository_id = repository_id;
+            self.set_commit_history(CommitHistory::Loading, cx);
+        }
+
         if self._repo_subscriptions.is_empty() {
-            self._repo_subscriptions.push(cx.subscribe(
-                &active_repository,
-                |this, _repo, event, cx| {
+            self._repo_subscriptions
+                .push(cx.subscribe(&repository, |this, _repo, event, cx| {
                     if let RepositoryEvent::GraphEvent(_, _) = event {
                         if this.active_tab == GitPanelTab::History {
                             this.fetch_commit_history_entries(cx);
                         }
                     }
-                },
-            ));
+                }));
             self._repo_subscriptions
-                .push(cx.observe(&active_repository, |_this, _repo, cx| {
+                .push(cx.observe(&repository, |_this, _repo, cx| {
                     cx.notify();
                 }));
         }
@@ -8065,18 +8180,19 @@ impl GitPanel {
     }
 
     fn fetch_commit_history_entries(&mut self, cx: &mut Context<Self>) {
-        let Some(active_repository) = self.active_repository.clone() else {
+        let Some(repository) = self.action_repository(cx) else {
+            self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
             return;
         };
 
-        let Some(log_source) = Self::commit_history_log_source(&active_repository, cx) else {
+        let Some(log_source) = Self::commit_history_log_source(&repository, cx) else {
             // No HEAD commit at all (unborn/empty repository).
             self.set_commit_history(CommitHistory::Loaded(Rc::from([])), cx);
             return;
         };
         let log_order = LogOrder::DateOrder;
 
-        let (entries, is_loading, error) = active_repository.update(cx, |repository, cx| {
+        let (entries, is_loading, error) = repository.update(cx, |repository, cx| {
             let response = repository.graph_data(log_source, log_order, 0..usize::MAX, cx);
             let entries: Rc<[CommitHistoryEntry]> = response
                 .commits
@@ -8115,7 +8231,7 @@ impl GitPanel {
     }
 
     fn git_remote(&self, cx: &mut App) -> Option<GitRemote> {
-        let repo = self.active_repository.as_ref()?;
+        let repo = self.action_repository(cx)?;
         let remote_url = repo.read(cx).default_remote_url()?;
         let provider_registry = GitHostingProviderRegistry::default_global(cx);
         let (provider, parsed) = parse_git_remote_url(provider_registry, &remote_url)?;
@@ -8135,9 +8251,9 @@ impl GitPanel {
             return None;
         };
         let entries = entries.clone();
-        let active_repository = self.active_repository.as_ref()?;
+        let repository = self.action_repository(cx)?;
         let workspace = self.workspace.clone();
-        let repo_weak = active_repository.downgrade();
+        let repo_weak = repository.downgrade();
         let item_count = entries.len();
         let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
         let remote = self.git_remote(cx);
@@ -8151,7 +8267,7 @@ impl GitPanel {
             .as_ref()
             .and_then(|context_menu| context_menu.target_entry_index);
 
-        let ahead_count = active_repository
+        let ahead_count = repository
             .read(cx)
             .branch
             .as_ref()
@@ -8888,7 +9004,7 @@ impl GitPanel {
             .tooltip(Tooltip::text(tooltip))
             .on_click(move |_, window, cx| {
                 weak.update(cx, |this, cx| {
-                    this.selected_entry = Some(ix);
+                    this.set_selected_entry_index(ix);
                     this.toggle_project_repositories(window, cx);
                     cx.stop_propagation();
                 })
@@ -8979,12 +9095,16 @@ impl GitPanel {
         let repository_id = entry.repository_id;
         let is_active = entry.is_active;
         let selected = self.selected_entry == Some(ix);
-        let repository_tooltip = if is_active {
+        let repository_tooltip = if entry.unavailable {
+            format!("Unavailable repository: {}", entry.work_directory)
+        } else if is_active {
             format!("Active repository: {}", entry.work_directory)
         } else {
             format!("Use as active repository: {}", entry.work_directory)
         };
-        let branch_tooltip = if entry.kind == GitRepositoryKind::Submodule {
+        let branch_tooltip = if entry.unavailable {
+            format!("Unavailable repository: {}", entry.work_directory)
+        } else if entry.kind == GitRepositoryKind::Submodule {
             if let Some(parent) = entry.parent_display_name.as_ref() {
                 format!(
                     "Switch branch in submodule {}. Its commit is recorded by {}.",
@@ -9006,7 +9126,7 @@ impl GitPanel {
         let branch_panel = cx.weak_entity();
         let project_depth = self.project_repository_depth(repository_id);
         let repository_expanded = entry.expanded;
-        let repository_has_changes = entry.change_count > 0;
+        let repository_has_changes = entry.change_count > 0 && !entry.unavailable;
         let disclosure_action = if repository_expanded {
             "Collapse"
         } else {
@@ -9041,7 +9161,7 @@ impl GitPanel {
         .on_click(move |_, window, cx| {
             collapse_panel
                 .update(cx, |this, cx| {
-                    this.selected_entry = Some(ix);
+                    this.set_selected_entry_index(ix);
                     this.toggle_repository(repository_id, window, cx);
                     cx.stop_propagation();
                 })
@@ -9053,7 +9173,9 @@ impl GitPanel {
                 .full_width()
                 .height(self.list_item_height().into())
                 .style(ButtonStyle::Transparent)
-                .aria_label(if is_active {
+                .aria_label(if entry.unavailable {
+                    format!("Unavailable repository: {}", entry.display_name)
+                } else if is_active {
                     format!("Active repository: {}", entry.display_name)
                 } else {
                     format!("Use {} as the active repository", entry.display_name)
@@ -9062,11 +9184,12 @@ impl GitPanel {
                     button.aria_description(description)
                 })
                 .tab_index(0isize)
+                .disabled(entry.unavailable)
                 .tooltip(Tooltip::text(repository_tooltip))
                 .on_click(move |_, _, cx| {
                     activate_panel
                         .update(cx, |this, cx| {
-                            this.selected_entry = Some(ix);
+                            this.set_selected_entry_index(ix);
                             this.activate_repository(repository_id, cx);
                             cx.notify();
                         })
@@ -9110,12 +9233,17 @@ impl GitPanel {
         )
         .full_width()
         .truncate(true)
-        .aria_label(format!("Switch branch in {}", entry.display_name))
+        .aria_label(if entry.unavailable {
+            format!("Unavailable repository: {}", entry.display_name)
+        } else {
+            format!("Switch branch in {}", entry.display_name)
+        })
         .aria_value(entry.branch_label.clone())
         .when_some(submodule_description, |button, description| {
             button.aria_description(description)
         })
-        .tab_index(0isize);
+        .tab_index(0isize)
+        .disabled(entry.unavailable);
 
         let branch_selector = PopoverMenu::new(("repository-branch-picker", repository_id.0))
             .menu(move |window, cx| {
@@ -9293,7 +9421,7 @@ impl GitPanel {
                         .on_click(move |_, window, cx| {
                             collapse_weak
                                 .update(cx, |this, cx| {
-                                    this.selected_entry = Some(ix);
+                                    this.set_selected_entry_index(ix);
                                     this.toggle_section(repository_id, section, window, cx);
                                     cx.stop_propagation();
                                 })
@@ -9316,7 +9444,7 @@ impl GitPanel {
                     .on_click(move |_, window, cx| {
                         stage_weak
                             .update(cx, |this, cx| {
-                                this.selected_entry = Some(ix);
+                                this.set_selected_entry_index(ix);
                                 if !has_write_access || all_conflicts_resolved {
                                     cx.notify();
                                     return;
@@ -9352,7 +9480,7 @@ impl GitPanel {
             .on_click(move |_, window, cx| {
                 row_weak
                     .update(cx, |this, cx| {
-                        this.selected_entry = Some(ix);
+                        this.set_selected_entry_index(ix);
                         if section_is_empty {
                             cx.notify();
                             return;
@@ -9412,7 +9540,7 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         if matches!(self.entries.get(ix), Some(GitListEntry::Directory(_))) {
-            self.selected_entry = Some(ix);
+            self.set_selected_entry_index(ix);
             self.deploy_panel_context_menu(position, Some(ix), true, window, cx);
             return;
         }
@@ -9473,7 +9601,7 @@ impl GitPanel {
                         .action("View File History", Box::new(git::FileHistory))
                 })
         });
-        self.selected_entry = Some(ix);
+        self.set_selected_entry_index(ix);
         self.set_context_menu(context_menu, position, None, window, cx);
     }
 
@@ -10360,6 +10488,7 @@ impl Render for GitPanel {
                     .on_action(cx.listener(Self::stash_all))
                     .on_action(cx.listener(Self::stash_tracked))
                     .on_action(cx.listener(Self::stash_staged))
+                    .on_action(cx.listener(Self::stash_selected))
                     .on_action(cx.listener(Self::stash_pop))
             })
             .on_action(cx.listener(Self::collapse_selected_entry))
@@ -11671,6 +11800,113 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_history_follows_selected_repository_without_changing_active_repo(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            "/root",
+            json!({
+                "project-a": { ".git": {} },
+                "project-b": { ".git": {} }
+            }),
+        )
+        .await;
+        let sha_a: Oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let sha_b: Oid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
+        for (path, sha) in [
+            (path!("/root/project-a/.git"), sha_a),
+            (path!("/root/project-b/.git"), sha_b),
+        ] {
+            fs.with_git_state(Path::new(path), false, |state| {
+                state.current_branch_name = None;
+                state.refs.insert("HEAD".into(), sha.to_string());
+                state.graph_commits = vec![Arc::new(git::repository::InitialGraphCommitData {
+                    sha,
+                    parents: SmallVec::new(),
+                    ref_names: Vec::new(),
+                })];
+            })
+            .unwrap();
+        }
+        let project = Project::test(
+            fs,
+            [
+                Path::new(path!("/root/project-a")),
+                Path::new(path!("/root/project-b")),
+            ],
+            cx,
+        )
+        .await;
+        let repository_a = project.read_with(cx, |project, cx| {
+            project
+                .git_store()
+                .read(cx)
+                .repositories()
+                .values()
+                .find(|repo| {
+                    repo.read(cx).work_directory_abs_path.as_ref()
+                        == Path::new(path!("/root/project-a"))
+                })
+                .unwrap()
+                .clone()
+        });
+        repository_a.update(cx, |repo, cx| repo.set_as_active_repository(cx));
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |workspace, _| workspace.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().show_all_repositories = Some(true);
+                });
+            });
+        });
+        cx.run_until_parked();
+        register_git_commit_language(&project, &mut cx);
+        let panel = workspace.update_in(&mut cx, GitPanel::new);
+        await_git_panel_entries(&panel, &mut cx).await;
+        for (path, sha) in [
+            (path!("/root/project-b"), sha_b),
+            (path!("/root/project-a"), sha_a),
+            (path!("/root/project-b"), sha_b),
+        ] {
+            panel.update_in(&mut cx, |panel, window, cx| {
+                let index = panel
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, entry)| {
+                        let GitListEntry::RepositoryHeader(header) = entry else {
+                            return None;
+                        };
+                        let repository = panel.repository_for_id(header.repository_id, cx)?;
+                        (repository.read(cx).work_directory_abs_path.as_ref() == Path::new(path))
+                            .then_some(index)
+                    })
+                    .unwrap();
+                panel.set_selected_entry_index(index);
+                panel.set_active_tab(GitPanelTab::History, window, cx);
+                panel.load_commit_history(cx);
+            });
+            cx.run_until_parked();
+            panel.read_with(&cx, |panel, _| {
+                assert_eq!(
+                    panel.commit_history_entries().iter().map(|entry| entry.sha).collect::<Vec<_>>(),
+                    vec![sha],
+                );
+            });
+            project.read_with(&cx, |project, cx| {
+                assert_eq!(project.active_repository(cx), Some(repository_a.clone()));
+            });
+        }
+    }
+
+    #[gpui::test]
     async fn test_history_tab_stops_loading_for_unborn_branch(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -11758,19 +11994,6 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    async fn test_history_tab_without_repository(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.background_executor.clone());
-        fs.insert_tree("/root", json!({ "project": {} })).await;
-
-        let panel = history_panel_for_project(fs.clone(), cx).await;
-
-        panel.read_with(cx, |panel, _| {
-            assert_eq!(panel.commit_history, CommitHistory::Loading);
-        });
-    }
 
     #[test]
     fn test_commit_history_from_response() {
