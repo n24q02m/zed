@@ -515,6 +515,12 @@ impl sum_tree::KeyedItem for StatusEntry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositoryId(pub u64);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub is_dirty: bool,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorktreeStatus {
@@ -6367,6 +6373,45 @@ impl Repository {
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
     }
+    pub fn worktree_status(
+        &self,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WorktreeStatus>> {
+        let repository_state = self.repository_state.clone();
+        cx.spawn(async move |_, _cx| {
+            let state = repository_state.await.map_err(|error| anyhow!(error))?;
+            let RepositoryState::Local(local_state) = state else {
+                bail!("worktree status is unavailable for remote repositories");
+            };
+
+            let system_git_binary_path = local_state
+                .environment
+                .get("PATH")
+                .and_then(|search_paths| {
+                    which::which_in("git", Some(search_paths), &worktree_path).ok()
+                })
+                .or_else(|| which::which("git").ok());
+            let backend = local_state.fs.open_repo(
+                &worktree_path.join(".git"),
+                system_git_binary_path.as_deref(),
+            )?;
+            let status = backend.status(&[]).await?;
+            let branch = backend
+                .branches()
+                .await?
+                .branches
+                .into_iter()
+                .find(|branch| branch.is_head);
+            let tracking = branch.and_then(|branch| branch.tracking_status());
+
+            Ok(WorktreeStatus {
+                is_dirty: !status.entries.is_empty(),
+                ahead: tracking.map(|tracking| tracking.ahead),
+                behind: tracking.map(|tracking| tracking.behind),
+            })
+        })
+    }
 
     pub fn worktree_status(
         &self,
@@ -9109,17 +9154,15 @@ impl Repository {
         worktree_directory_setting: &str,
     ) -> Result<PathBuf> {
         let repository_anchor = self.linked_worktree_anchor_path();
-        let project_name = repository_anchor
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("git repo must have a directory name"))?;
+        // worktrees_directory_for_repo already appends the repository
+        // directory name for collision-free placement, so the branch name is
+        // the final component and basename() identifies the worktree.
         let directory = worktrees_directory_for_repo(
             repository_anchor,
             worktree_directory_setting,
             self.path_style,
         )?;
-        let directory = self.path_style.join_path(&directory, branch_name)?;
-        self.path_style.join_path(&directory, project_name)
+        self.path_style.join_path(&directory, branch_name)
     }
 
     pub fn worktrees(&mut self) -> oneshot::Receiver<Result<Vec<GitWorktree>>> {
@@ -11891,10 +11934,13 @@ mod tests {
         let work_dir = Path::new("/home/user/dev/lsp-tests");
         let directory =
             worktrees_directory_for_repo(work_dir, "../worktrees", PathStyle::Unix).unwrap();
-        let directory = PathStyle::Unix.join_path(&directory, "nimble-sky").unwrap();
-        let path = PathStyle::Unix.join_path(&directory, "lsp-tests").unwrap();
+        let path = PathStyle::Unix.join_path(&directory, "nimble-sky").unwrap();
 
         assert_eq!(
+            path,
+            PathBuf::from("/home/user/dev/worktrees/lsp-tests/nimble-sky")
+        );
+        assert_ne!(
             path,
             PathBuf::from("/home/user/dev/worktrees/lsp-tests/nimble-sky/lsp-tests")
         );
