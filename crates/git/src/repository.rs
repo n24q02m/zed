@@ -2604,6 +2604,9 @@ impl GitRepository for RealGitRepository {
         message: Option<String>,
         env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
+        if paths.is_empty() {
+            return async { Ok(()) }.boxed();
+        }
         let git = self.git_binary_in_worktree();
         self.executor
             .spawn(async move {
@@ -6774,5 +6777,235 @@ mod tests {
             remote_urls.get("upstream").unwrap(),
             "/Users/user/My Projects/upstream.git"
         );
+    }
+}
+
+#[cfg(test)]
+mod stash_selected_tests {
+    use std::{ffi::OsStr, fs, path::Path, sync::Arc};
+
+    use collections::FxHashMap;
+
+    use super::{GitRepository, RealGitRepository};
+    use gpui::TestAppContext;
+
+    #[allow(clippy::disallowed_methods)]
+    fn git_command<I, S>(working_directory: &Path, arguments: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(working_directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+            .output()
+            .expect("failed to run git command");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn status(working_directory: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(working_directory)
+            .output()
+            .expect("failed to read git status");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn git_output<I, S>(working_directory: &Path, arguments: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(working_directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .output()
+            .expect("failed to run git command");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+    #[gpui::test]
+    async fn empty_selected_paths_do_not_stash_everything(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        git_command(temp_dir.path(), ["init", "-b", "main"]);
+        fs::write(temp_dir.path().join("selected.txt"), "before").unwrap();
+        git_command(temp_dir.path(), ["add", "selected.txt"]);
+        git_command(temp_dir.path(), ["commit", "-m", "initial"]);
+        fs::write(temp_dir.path().join("selected.txt"), "after").unwrap();
+
+        let repo = RealGitRepository::new(
+            &temp_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        repo.stash_paths(Vec::new(), None, Arc::new(FxHashMap::default()))
+            .await
+            .unwrap();
+
+        assert_eq!(status(temp_dir.path()), " M selected.txt\n");
+        assert!(git_output(temp_dir.path(), ["stash", "list"]).is_empty());
+    }
+
+    fn repository(temp_dir: &tempfile::TempDir, cx: &TestAppContext) -> RealGitRepository {
+        RealGitRepository::new(
+            &temp_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap()
+    }
+
+    fn empty_environment() -> Arc<FxHashMap<String, String>> {
+        Arc::new(FxHashMap::default())
+    }
+
+    fn commit_files(temp_dir: &Path, files: &[(&str, &str)]) {
+        for (path, contents) in files {
+            let path = temp_dir.join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, contents).unwrap();
+        }
+        git_command(temp_dir, ["add", "."]);
+        git_command(temp_dir, ["commit", "-m", "initial"]);
+    }
+
+    #[gpui::test]
+    async fn selected_stash_preserves_unrelated_unstaged_changes(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        git_command(temp_dir.path(), ["init", "-b", "main"]);
+        commit_files(
+            temp_dir.path(),
+            &[("selected.txt", "before"), ("unrelated.txt", "before")],
+        );
+        fs::write(temp_dir.path().join("selected.txt"), "selected after").unwrap();
+        fs::write(temp_dir.path().join("unrelated.txt"), "unrelated after").unwrap();
+
+        repository(&temp_dir, cx)
+            .stash_paths(
+                vec![super::repo_path("selected.txt")],
+                Some("selected unstaged".to_owned()),
+                empty_environment(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_output(temp_dir.path(), ["status", "--porcelain"]),
+            " M unrelated.txt\n"
+        );
+        assert!(git_output(temp_dir.path(), ["stash", "list"]).contains("selected unstaged"));
+    }
+
+    #[gpui::test]
+    async fn selected_stash_preserves_unrelated_state_with_staged_and_unstaged_changes(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        git_command(temp_dir.path(), ["init", "-b", "main"]);
+        commit_files(
+            temp_dir.path(),
+            &[("selected.txt", "before"), ("unrelated.txt", "before")],
+        );
+        fs::write(temp_dir.path().join("selected.txt"), "selected staged").unwrap();
+        git_command(temp_dir.path(), ["add", "selected.txt"]);
+        fs::write(temp_dir.path().join("selected.txt"), "selected unstaged").unwrap();
+        fs::write(temp_dir.path().join("unrelated.txt"), "unrelated after").unwrap();
+
+        repository(&temp_dir, cx)
+            .stash_paths(
+                vec![super::repo_path("selected.txt")],
+                Some("selected staged and unstaged".to_owned()),
+                empty_environment(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_output(temp_dir.path(), ["status", "--porcelain"]),
+            " M unrelated.txt\n"
+        );
+        assert!(
+            git_output(temp_dir.path(), ["stash", "list"]).contains("selected staged and unstaged")
+        );
+    }
+
+    #[gpui::test]
+    async fn selected_stash_handles_deleted_files(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        git_command(temp_dir.path(), ["init", "-b", "main"]);
+        commit_files(
+            temp_dir.path(),
+            &[("deleted.txt", "before"), ("unrelated.txt", "before")],
+        );
+        fs::remove_file(temp_dir.path().join("deleted.txt")).unwrap();
+
+        repository(&temp_dir, cx)
+            .stash_paths(
+                vec![super::repo_path("deleted.txt")],
+                Some("selected deleted".to_owned()),
+                empty_environment(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(git_output(temp_dir.path(), ["status", "--porcelain"]), "");
+        assert!(git_output(temp_dir.path(), ["stash", "list"]).contains("selected deleted"));
+    }
+
+    #[gpui::test]
+    async fn selected_stash_handles_renamed_directory(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        git_command(temp_dir.path(), ["init", "-b", "main"]);
+        commit_files(
+            temp_dir.path(),
+            &[("renamed/old.txt", "before"), ("unrelated.txt", "before")],
+        );
+        git_command(
+            temp_dir.path(),
+            ["mv", "renamed/old.txt", "renamed/new.txt"],
+        );
+
+        repository(&temp_dir, cx)
+            .stash_paths(
+                vec![super::repo_path("renamed")],
+                Some("selected rename".to_owned()),
+                empty_environment(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(git_output(temp_dir.path(), ["status", "--porcelain"]), "");
+        assert!(git_output(temp_dir.path(), ["stash", "list"]).contains("selected rename"));
     }
 }

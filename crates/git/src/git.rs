@@ -87,7 +87,8 @@ actions!(
         StashTracked,
         /// Stashes staged changes in the repository, leaving unstaged changes in place.
         StashStaged,
-        /// Pops the most recent stash.
+        /// Stashes changes for the selected file or directory.
+        StashFile,
         StashPop,
         /// Apply the most recent stash.
         StashApply,
