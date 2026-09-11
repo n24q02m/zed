@@ -13,7 +13,7 @@ use gpui::{
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::{
     Project,
-    git_store::{RepositoryEvent, RepositoryId, WorktreeStatus},
+    git_store::{RepositoryEvent, RepositoryId},
     repo_identity_path_if_local,
 };
 use ui::{
@@ -136,6 +136,7 @@ impl WorktreePicker {
             active_worktree_paths,
             hovered_delete_index: None,
             deleting_worktree_paths: HashSet::default(),
+            refresh_task: None,
         };
 
         let picker = cx.new(|cx| {
@@ -227,21 +228,52 @@ impl WorktreePicker {
                 move |_this, repo, event: &RepositoryEvent, window, cx| {
                     if matches!(event, RepositoryEvent::GitWorktreeListChanged) {
                         let worktrees_request = repo.update(cx, |repo, _| repo.worktrees());
+                        let status_repository = repo.clone();
                         let picker = picker_entity.clone();
-                        cx.spawn_in(window, async move |_, cx| {
+                        let refresh_task = cx.spawn_in(window, async move |_, cx| {
                             let all_worktrees: Vec<_> = worktrees_request
                                 .await??
                                 .into_iter()
                                 .filter(|wt| !wt.is_bare)
                                 .collect();
+                            let mut loaded_statuses = HashMap::default();
+                            for worktree in &all_worktrees {
+                                let path = worktree.path.clone();
+                                match status_repository
+                                    .update(cx, |repository, cx| {
+                                        repository.worktree_status(path.clone(), cx)
+                                    })
+                                    .await
+                                {
+                                    Ok(status) => {
+                                        loaded_statuses.insert(path, status);
+                                    }
+                                    Err(error) => {
+                                        log::debug!(
+                                            "WorktreePicker: status load failed for {path:?}: {error}"
+                                        );
+                                    }
+                                }
+                            }
                             picker.update_in(cx, |picker, window, cx| {
                                 picker.delegate.all_worktrees = all_worktrees;
                                 picker.delegate.refresh_worktree_statuses(cx);
+                                for (path, loaded_status) in loaded_statuses {
+                                    if let Some(status) = picker.delegate.worktree_statuses.get_mut(&path) {
+                                        status.is_dirty = Some(loaded_status.is_dirty);
+                                        status.ahead = loaded_status.ahead;
+                                        status.behind = loaded_status.behind;
+                                    }
+                                }
                                 picker.refresh(window, cx);
                             })?;
                             anyhow::Ok(())
-                        })
-                        .detach_and_log_err(cx);
+                        });
+                        picker_entity
+                            .update_in(cx, |picker, _window, _cx| {
+                                picker.delegate.refresh_task = Some(refresh_task);
+                            })
+                            .log_err();
                     } else if matches!(
                         event,
                         RepositoryEvent::StatusesChanged
@@ -341,6 +373,39 @@ enum WorktreeEntry {
         disabled_reason: Option<String>,
     },
 }
+
+fn worktree_dirty_label(is_dirty: Option<bool>) -> &'static str {
+    match is_dirty {
+        Some(true) => "dirty",
+        Some(false) => "clean",
+        None => "unavailable",
+    }
+}
+
+fn worktree_tracking_label(
+    branch_name: Option<&str>,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+) -> String {
+    match (branch_name, ahead, behind) {
+        (None, _, _) => "not applicable".to_string(),
+        (Some(_), Some(ahead), Some(behind)) if ahead == 0 && behind == 0 => {
+            "up to date".to_string()
+        }
+        (Some(_), Some(ahead), Some(behind)) => format!("↑{ahead} ↓{behind}"),
+        (Some(_), _, _) => "unavailable".to_string(),
+    }
+}
+
+fn worktree_matches_repository(
+    worktree_path: &Path,
+    repository_worktree_path: Option<&Path>,
+    repository_identity_path: Option<&Path>,
+    picker_identity_path: Option<&Path>,
+) -> bool {
+    repository_worktree_path == Some(worktree_path)
+        || repository_identity_path.is_some() && repository_identity_path == picker_identity_path
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorktreePickerStatus {
     repository_id: RepositoryId,
@@ -396,6 +461,7 @@ struct WorktreePickerDelegate {
     modifiers: Modifiers,
     hovered_delete_index: Option<usize>,
     deleting_worktree_paths: HashSet<PathBuf>,
+    refresh_task: Option<Task<anyhow::Result<()>>>,
 }
 
 fn worktree_name_anchor<'a>(
@@ -548,33 +614,43 @@ impl WorktreePickerDelegate {
             None
         }
     }
+
     fn status_for_worktree(&self, worktree: &GitWorktree, cx: &App) -> WorktreePickerStatus {
         let fallback_repository_id = self.repository_id.unwrap_or(RepositoryId(0));
         let fallback_identity_path = self.repository_identity_path.clone().unwrap_or_default();
         let project = self.project.read(cx);
         let repositories = project.repositories(cx);
-        let matching_repository = repositories.values().find(|repository| {
+        let worktree_repository = repositories.values().find(|repository| {
             repository.read(cx).work_directory_abs_path.as_ref() == worktree.path.as_path()
         });
+        let identity_repository = repositories.values().find(|repository| {
+            let repository = repository.read(cx);
+            worktree_matches_repository(
+                worktree.path.as_path(),
+                Some(repository.work_directory_abs_path.as_ref()),
+                repo_identity_path_if_local(&repository.common_dir_abs_path, repository.path_style),
+                self.repository_identity_path.as_deref(),
+            )
+        });
 
-        let (repository_id, repository_identity_path, is_dirty) =
-            if let Some(repository) = matching_repository {
+        let (repository_id, repository_identity_path) =
+            if let Some(repository) = identity_repository {
                 let snapshot = repository.read(cx);
                 let identity_path =
                     repo_identity_path_if_local(&snapshot.common_dir_abs_path, snapshot.path_style)
                         .map(Path::to_path_buf)
                         .unwrap_or_else(|| fallback_identity_path.clone());
-                (
-                    snapshot.id,
-                    identity_path,
-                    Some(snapshot.status_summary().count > 0),
-                )
+                (snapshot.id, identity_path)
             } else {
-                (fallback_repository_id, fallback_identity_path, None)
+                (fallback_repository_id, fallback_identity_path)
             };
+        let is_dirty = worktree_repository.map(|repository| {
+            let snapshot = repository.read(cx);
+            snapshot.status_summary().count > 0
+        });
 
-        let tracking = worktree.branch_name().and_then(|branch_name| {
-            repositories.values().find_map(|repository| {
+        let tracking = identity_repository.and_then(|repository| {
+            worktree.branch_name().and_then(|branch_name| {
                 repository
                     .read(cx)
                     .branch_list
@@ -997,7 +1073,7 @@ impl PickerDelegate for WorktreePickerDelegate {
 
             if !repo_worktrees.is_empty() {
                 let project_paths = &self.project_worktree_paths;
-                let (mut open_here, mut others): (Vec<_>, Vec<_>) = self
+                let (mut open_here, others): (Vec<_>, Vec<_>) = self
                     .sorted_worktree_rows()
                     .into_iter()
                     .partition(|row| project_paths.contains(&row.worktree.path));
@@ -1315,23 +1391,21 @@ impl PickerDelegate for WorktreePickerDelegate {
                     .collect();
                 let path = worktree.path.compact().to_string_lossy().to_string();
                 let sha = worktree.sha.chars().take(7).collect::<String>();
-                let branch_label = worktree.branch_name().unwrap_or("detached");
-                let dirty_label = match status.is_dirty {
-                    Some(true) => "dirty",
-                    Some(false) => "clean",
-                    None => "status loading…",
+                let branch_name = worktree.branch_name();
+                let branch_label = branch_name.unwrap_or("detached");
+                let dirty_label = worktree_dirty_label(status.is_dirty);
+                let tracking_label =
+                    worktree_tracking_label(branch_name, status.ahead, status.behind);
+                let repository_identity = if status.repository_identity_path.as_os_str().is_empty()
+                {
+                    "unavailable".to_string()
+                } else {
+                    status
+                        .repository_identity_path
+                        .compact()
+                        .to_string_lossy()
+                        .to_string()
                 };
-                let tracking_label = match (status.ahead, status.behind) {
-                    (Some(0), Some(0)) => "up to date".to_string(),
-                    (Some(ahead), Some(behind)) => format!("↑{ahead} ↓{behind}"),
-                    _ if worktree.branch_name().is_some() => "no upstream".to_string(),
-                    _ => "".to_string(),
-                };
-                let repository_identity = status
-                    .repository_identity_path
-                    .compact()
-                    .to_string_lossy()
-                    .to_string();
 
                 let is_current = self.active_worktree_paths.contains(&worktree.path);
                 let is_deleting = self.deleting_worktree_paths.contains(&worktree.path);
@@ -2550,47 +2624,108 @@ mod tests {
     }
     #[test]
     fn worktree_picker_view_model_keeps_stable_order_and_all_context() {
-        let repository_id = project::git_store::RepositoryId(7);
-        let repository_identity_path = PathBuf::from("/repos/app");
-        let make_worktree = |name: &str, branch: Option<&str>, is_main: bool| GitWorktree {
-            path: PathBuf::from(format!("/repos/app/{name}")),
-            ref_name: branch.map(|branch| format!("refs/heads/{branch}").into()),
-            sha: "0123456789abcdef".into(),
-            is_main,
-            is_bare: false,
-        };
-        let status = |is_dirty, ahead, behind| WorktreePickerStatus {
-            repository_id,
-            repository_identity_path: repository_identity_path.clone(),
-            is_dirty,
-            ahead,
-            behind,
+        let repository_one = project::git_store::RepositoryId(7);
+        let repository_two = project::git_store::RepositoryId(8);
+        let repository_one_identity = PathBuf::from("/repos/one/app");
+        let repository_two_identity = PathBuf::from("/repos/two/app");
+        let make_worktree =
+            |repository: &str, name: &str, branch: Option<&str>, is_main: bool| GitWorktree {
+                path: PathBuf::from(format!("/repos/{repository}/{name}")),
+                ref_name: branch.map(|branch| format!("refs/heads/{branch}").into()),
+                sha: "0123456789abcdef".into(),
+                is_main,
+                is_bare: false,
+            };
+        let status = |repository_id, repository_identity_path, is_dirty, ahead, behind| {
+            WorktreePickerStatus {
+                repository_id,
+                repository_identity_path,
+                is_dirty,
+                ahead,
+                behind,
+            }
         };
 
         let rows = build_worktree_picker_view_model(vec![
             (
-                make_worktree("behind", Some("behind"), false),
-                status(Some(false), Some(0), Some(3)),
+                make_worktree("one", "behind", Some("behind"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(3),
+                ),
             ),
             (
-                make_worktree("detached", None, false),
-                status(Some(false), None, None),
+                make_worktree("one", "detached", None, false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
             ),
             (
-                make_worktree("dirty", Some("dirty"), false),
-                status(Some(true), Some(0), Some(0)),
+                make_worktree("one", "dirty", Some("dirty"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(true),
+                    Some(0),
+                    Some(0),
+                ),
             ),
             (
-                make_worktree("ahead", Some("ahead"), false),
-                status(Some(false), Some(4), Some(0)),
+                make_worktree("one", "ahead", Some("ahead"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(4),
+                    Some(0),
+                ),
             ),
             (
-                make_worktree("main", Some("main"), true),
-                status(Some(false), Some(0), Some(0)),
+                make_worktree("one", "main", Some("main"), true),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(0),
+                    Some(0),
+                ),
             ),
             (
-                make_worktree("missing-upstream", Some("local"), false),
-                status(Some(false), None, None),
+                make_worktree("one", "missing-upstream", Some("local"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    None,
+                    None,
+                ),
+            ),
+            (
+                make_worktree("one", "shared", Some("shared"), false),
+                status(
+                    repository_one,
+                    repository_one_identity.clone(),
+                    Some(false),
+                    Some(1),
+                    Some(2),
+                ),
+            ),
+            (
+                make_worktree("two", "shared", Some("shared"), false),
+                status(
+                    repository_two,
+                    repository_two_identity.clone(),
+                    Some(true),
+                    Some(3),
+                    Some(0),
+                ),
             ),
         ]);
 
@@ -2617,9 +2752,9 @@ mod tests {
                 (
                     "ahead".to_string(),
                     Some("ahead".to_string()),
-                    PathBuf::from("/repos/app/ahead"),
-                    repository_id,
-                    repository_identity_path.clone(),
+                    PathBuf::from("/repos/one/ahead"),
+                    repository_one,
+                    repository_one_identity.clone(),
                     Some(false),
                     Some(4),
                     Some(0),
@@ -2627,9 +2762,9 @@ mod tests {
                 (
                     "behind".to_string(),
                     Some("behind".to_string()),
-                    PathBuf::from("/repos/app/behind"),
-                    repository_id,
-                    repository_identity_path.clone(),
+                    PathBuf::from("/repos/one/behind"),
+                    repository_one,
+                    repository_one_identity.clone(),
                     Some(false),
                     Some(0),
                     Some(3),
@@ -2637,9 +2772,9 @@ mod tests {
                 (
                     "detached".to_string(),
                     None,
-                    PathBuf::from("/repos/app/detached"),
-                    repository_id,
-                    repository_identity_path.clone(),
+                    PathBuf::from("/repos/one/detached"),
+                    repository_one,
+                    repository_one_identity.clone(),
                     Some(false),
                     None,
                     None,
@@ -2647,9 +2782,9 @@ mod tests {
                 (
                     "dirty".to_string(),
                     Some("dirty".to_string()),
-                    PathBuf::from("/repos/app/dirty"),
-                    repository_id,
-                    repository_identity_path.clone(),
+                    PathBuf::from("/repos/one/dirty"),
+                    repository_one,
+                    repository_one_identity.clone(),
                     Some(true),
                     Some(0),
                     Some(0),
@@ -2657,9 +2792,9 @@ mod tests {
                 (
                     "main worktree".to_string(),
                     Some("main".to_string()),
-                    PathBuf::from("/repos/app/main"),
-                    repository_id,
-                    repository_identity_path.clone(),
+                    PathBuf::from("/repos/one/main"),
+                    repository_one,
+                    repository_one_identity.clone(),
                     Some(false),
                     Some(0),
                     Some(0),
@@ -2667,14 +2802,77 @@ mod tests {
                 (
                     "missing-upstream".to_string(),
                     Some("local".to_string()),
-                    PathBuf::from("/repos/app/missing-upstream"),
-                    repository_id,
-                    repository_identity_path,
+                    PathBuf::from("/repos/one/missing-upstream"),
+                    repository_one,
+                    repository_one_identity.clone(),
                     Some(false),
                     None,
                     None,
                 ),
+                (
+                    "shared".to_string(),
+                    Some("shared".to_string()),
+                    PathBuf::from("/repos/one/shared"),
+                    repository_one,
+                    repository_one_identity,
+                    Some(false),
+                    Some(1),
+                    Some(2),
+                ),
+                (
+                    "shared".to_string(),
+                    Some("shared".to_string()),
+                    PathBuf::from("/repos/two/shared"),
+                    repository_two,
+                    repository_two_identity,
+                    Some(true),
+                    Some(3),
+                    Some(0),
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn worktree_picker_status_labels_are_explicit_for_all_tracking_states() {
+        assert_eq!(worktree_dirty_label(Some(false)), "clean");
+        assert_eq!(worktree_dirty_label(Some(true)), "dirty");
+        assert_eq!(worktree_dirty_label(None), "unavailable");
+        assert_eq!(worktree_tracking_label(None, None, None), "not applicable");
+        assert_eq!(
+            worktree_tracking_label(Some("feature"), None, None),
+            "unavailable"
+        );
+        assert_eq!(
+            worktree_tracking_label(Some("feature"), Some(4), Some(2)),
+            "↑4 ↓2"
+        );
+        assert_eq!(
+            worktree_tracking_label(Some("feature"), Some(0), Some(0)),
+            "up to date"
+        );
+    }
+    #[test]
+    fn worktree_picker_tracking_lookup_requires_repository_identity() {
+        let worktree_path = Path::new("/repos/one/linked");
+        let picker_identity = Path::new("/repos/one/.git");
+        assert!(worktree_matches_repository(
+            worktree_path,
+            None,
+            Some(picker_identity),
+            Some(picker_identity),
+        ));
+        assert!(!worktree_matches_repository(
+            worktree_path,
+            None,
+            Some(Path::new("/repos/two/.git")),
+            Some(picker_identity),
+        ));
+        assert!(!worktree_matches_repository(
+            worktree_path,
+            None,
+            None,
+            None
+        ));
     }
 }
