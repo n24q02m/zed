@@ -1258,7 +1258,6 @@ pub struct GitPanel {
     marked_entries: Vec<GitPanelEntryId>,
     selection_anchor: Option<GitPanelEntryId>,
     marked_paths: HashSet<RepoPath>,
-    marked_paths: HashSet<RepoPath>,
     marked_directories: HashSet<TreeKey>,
     mark_range_gesture: Option<MarkRangeGesture>,
     tracked_count: usize,
@@ -1578,7 +1577,6 @@ impl GitPanel {
                 selected_entry_id: None,
                 marked_entries: Vec::new(),
                 selection_anchor: None,
-                marked_paths: HashSet::default(),
                 marked_paths: HashSet::default(),
                 marked_directories: HashSet::default(),
                 mark_range_gesture: None,
@@ -8310,6 +8308,14 @@ impl GitPanel {
                 .and_then(|repo_id| self.entry_identity(ix, repo_id));
             self.selection_anchor = self.selected_entry_id.clone();
             self.deploy_panel_context_menu(position, Some(ix), true, window, cx);
+            return;
+        };
+        let Some(entry) = self
+            .entries
+            .get(ix)
+            .and_then(|e| e.status_entry())
+            .cloned()
+        else {
             return;
         };
         if !self

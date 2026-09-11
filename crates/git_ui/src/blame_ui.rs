@@ -1060,6 +1060,9 @@ mod tests {
             blame_heatmap_tint(BlameAgeBucket::Unknown, false),
             BlameHeatmapTint::Default
         );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlameHoverMetadata {
     short_commit_hash: String,
