@@ -4022,7 +4022,6 @@ impl GitBinary {
             command.args(["-c", "credential.interactive=false"]);
             command.args(["-c", "gc.auto=0"]);
         }
-        command.args(args);
 
         // If the `diff` command is being used, we'll want to add the
         // `--no-ext-diff` flag when working on an untrusted repository,
