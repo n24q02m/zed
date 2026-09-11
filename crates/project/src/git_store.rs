@@ -6688,7 +6688,6 @@ impl Repository {
         })
     }
 
-
     pub fn pending_ops(&self) -> impl Iterator<Item = PendingOps> + '_ {
         self.pending_ops.iter().cloned()
     }

@@ -8310,12 +8310,7 @@ impl GitPanel {
             self.deploy_panel_context_menu(position, Some(ix), true, window, cx);
             return;
         };
-        let Some(entry) = self
-            .entries
-            .get(ix)
-            .and_then(|e| e.status_entry())
-            .cloned()
-        else {
+        let Some(entry) = self.entries.get(ix).and_then(|e| e.status_entry()).cloned() else {
             return;
         };
         if !self
