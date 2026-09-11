@@ -517,6 +517,19 @@ impl sum_tree::KeyedItem for StatusEntry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RepositoryId(pub u64);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub is_dirty: bool,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub is_dirty: bool,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+}
 
 /// Configuration for repository background fetches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6557,6 +6570,85 @@ impl Repository {
     pub fn snapshot(&self) -> RepositorySnapshot {
         self.snapshot.clone()
     }
+    pub fn worktree_status(
+        &self,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WorktreeStatus>> {
+        let repository_state = self.repository_state.clone();
+        cx.spawn(async move |_, _cx| {
+            let state = repository_state.await.map_err(|error| anyhow!(error))?;
+            let RepositoryState::Local(local_state) = state else {
+                bail!("worktree status is unavailable for remote repositories");
+            };
+
+            let system_git_binary_path = local_state
+                .environment
+                .get("PATH")
+                .and_then(|search_paths| {
+                    which::which_in("git", Some(search_paths), &worktree_path).ok()
+                })
+                .or_else(|| which::which("git").ok());
+            let backend = local_state.fs.open_repo(
+                &worktree_path.join(".git"),
+                system_git_binary_path.as_deref(),
+            )?;
+            let status = backend.status(&[]).await?;
+            let branch = backend
+                .branches()
+                .await?
+                .branches
+                .into_iter()
+                .find(|branch| branch.is_head);
+            let tracking = branch.and_then(|branch| branch.tracking_status());
+
+            Ok(WorktreeStatus {
+                is_dirty: !status.entries.is_empty(),
+                ahead: tracking.map(|tracking| tracking.ahead),
+                behind: tracking.map(|tracking| tracking.behind),
+            })
+        })
+    }
+
+    pub fn worktree_status(
+        &self,
+        worktree_path: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WorktreeStatus>> {
+        let repository_state = self.repository_state.clone();
+        cx.spawn(async move |_, _cx| {
+            let state = repository_state.await.map_err(|error| anyhow!(error))?;
+            let RepositoryState::Local(local_state) = state else {
+                bail!("worktree status is unavailable for remote repositories");
+            };
+
+            let system_git_binary_path = local_state
+                .environment
+                .get("PATH")
+                .and_then(|search_paths| {
+                    which::which_in("git", Some(search_paths), &worktree_path).ok()
+                })
+                .or_else(|| which::which("git").ok());
+            let backend = local_state.fs.open_repo(
+                &worktree_path.join(".git"),
+                system_git_binary_path.as_deref(),
+            )?;
+            let status = backend.status(&[]).await?;
+            let branch = backend
+                .branches()
+                .await?
+                .branches
+                .into_iter()
+                .find(|branch| branch.is_head);
+            let tracking = branch.and_then(|branch| branch.tracking_status());
+
+            Ok(WorktreeStatus {
+                is_dirty: !status.entries.is_empty(),
+                ahead: tracking.map(|tracking| tracking.ahead),
+                behind: tracking.map(|tracking| tracking.behind),
+            })
+        })
+    }
 
     pub fn pending_ops(&self) -> impl Iterator<Item = PendingOps> + '_ {
         self.pending_ops.iter().cloned()
@@ -8343,36 +8435,76 @@ impl Repository {
         message: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
+        if entries.is_empty() {
+            return Task::ready(Ok(()));
+        }
+        if entries.iter().any(|entry| entry.is_empty()) {
+            return Task::ready(Err(anyhow::anyhow!(
+                "cannot stash an empty or invalid selected path"
+            )));
+        }
         let id = self.id;
-
-        cx.spawn(async move |this, cx| {
-            this.update(cx, |this, _| {
-                this.send_job("stash_entries", None, move |git_repo, _cx| async move {
-                    match git_repo {
-                        RepositoryState::Local(LocalRepositoryState {
-                            backend,
-                            environment,
-                            ..
-                        }) => backend.stash_paths(entries, message, environment).await,
-                        RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
-                            client
-                                .request(proto::Stash {
-                                    project_id: project_id.0,
-                                    repository_id: id.to_proto(),
-                                    paths: entries
-                                        .into_iter()
-                                        .map(|repo_path| repo_path.as_unix_str().to_owned())
-                                        .collect(),
-                                    message,
-                                    staged: None,
-                                })
-                                .await?;
-                            Ok(())
+        let updates_tx = self
+            .git_store()
+            .and_then(|git_store| match &git_store.read(cx).state {
+                GitStoreState::Local { downstream, .. } => downstream
+                    .as_ref()
+                    .map(|downstream| downstream.updates_tx.clone()),
+                _ => None,
+            });
+        let this = cx.weak_entity();
+        cx.spawn(async move |this_task, cx| {
+            this_task
+                .update(cx, |this_repo, _| {
+                    this_repo.send_job("stash_entries", None, move |git_repo, mut cx| async move {
+                        match git_repo {
+                            RepositoryState::Local(LocalRepositoryState {
+                                backend,
+                                environment,
+                                ..
+                            }) => {
+                                let result =
+                                    backend.stash_paths(entries, message, environment).await;
+                                if result.is_ok()
+                                    && let Ok(stash_entries) = backend.stash_entries().await
+                                {
+                                    let snapshot = this.update(&mut cx, |this, cx| {
+                                        this.snapshot.stash_entries = stash_entries;
+                                        cx.emit(RepositoryEvent::StashEntriesChanged);
+                                        this.snapshot.clone()
+                                    })?;
+                                    if let Some(updates_tx) = updates_tx {
+                                        updates_tx
+                                            .unbounded_send(DownstreamUpdate::UpdateRepository(
+                                                snapshot,
+                                            ))
+                                            .ok();
+                                    }
+                                }
+                                result
+                            }
+                            RepositoryState::Remote(RemoteRepositoryState {
+                                project_id,
+                                client,
+                            }) => {
+                                client
+                                    .request(proto::Stash {
+                                        project_id: project_id.0,
+                                        repository_id: id.to_proto(),
+                                        paths: entries
+                                            .into_iter()
+                                            .map(|repo_path| repo_path.as_unix_str().to_owned())
+                                            .collect(),
+                                        message,
+                                        staged: None,
+                                    })
+                                    .await?;
+                                Ok(())
+                            }
                         }
-                    }
-                })
-            })?
-            .await??;
+                    })
+                })?
+                .await??;
             Ok(())
         })
     }
@@ -9266,17 +9398,15 @@ impl Repository {
         worktree_directory_setting: &str,
     ) -> Result<PathBuf> {
         let repository_anchor = self.linked_worktree_anchor_path();
-        let project_name = repository_anchor
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("git repo must have a directory name"))?;
+        // worktrees_directory_for_repo already appends the repository
+        // directory name for collision-free placement, so the branch name is
+        // the final component and basename() identifies the worktree.
         let directory = worktrees_directory_for_repo(
             repository_anchor,
             worktree_directory_setting,
             self.path_style,
         )?;
-        let directory = self.path_style.join_path(&directory, branch_name)?;
-        self.path_style.join_path(&directory, project_name)
+        self.path_style.join_path(&directory, branch_name)
     }
 
     pub fn worktrees(&mut self) -> oneshot::Receiver<Result<Vec<GitWorktree>>> {
@@ -12048,10 +12178,13 @@ mod tests {
         let work_dir = Path::new("/home/user/dev/lsp-tests");
         let directory =
             worktrees_directory_for_repo(work_dir, "../worktrees", PathStyle::Unix).unwrap();
-        let directory = PathStyle::Unix.join_path(&directory, "nimble-sky").unwrap();
-        let path = PathStyle::Unix.join_path(&directory, "lsp-tests").unwrap();
+        let path = PathStyle::Unix.join_path(&directory, "nimble-sky").unwrap();
 
         assert_eq!(
+            path,
+            PathBuf::from("/home/user/dev/worktrees/lsp-tests/nimble-sky")
+        );
+        assert_ne!(
             path,
             PathBuf::from("/home/user/dev/worktrees/lsp-tests/nimble-sky/lsp-tests")
         );
