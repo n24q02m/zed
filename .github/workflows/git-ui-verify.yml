@@ -1,0 +1,59 @@
+# Fork-only targeted Git verification workflow
+# Runs Git tests, project integration tests, and clippy on a GitHub-hosted Linux runner.
+# Uses a GitHub-hosted runner for reproducible contributor validation.
+name: git-ui-verify
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  CC: clang
+  CXX: clang++
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Install Linux dependencies
+        run: ./script/linux
+
+      # rustup reads the repository toolchain configuration.
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Build Git and project crates
+        run: cargo build -p git -p git_ui -p project --quiet
+
+      - name: Run Git crate tests
+        run: cargo test -p git -p git_ui --quiet
+
+      - name: Run project integration tests
+        run: cargo test -p project --test integration --features test-support --quiet
+
+      # Rustfmt does not require a linker.
+      - name: Format check
+        run: cargo fmt --check -p git -p git_ui -p project
+
+  clippy-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - name: Install Linux dependencies
+        run: ./script/linux
+      # Use the repository clippy script.
+      - name: Clippy (repo script)
+        run: ./script/clippy
