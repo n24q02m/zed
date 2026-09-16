@@ -1030,6 +1030,17 @@ impl GitListEntry {
         )
     }
 
+    /// Entries that auto-selection (`select_first`/`select_last`) may land on.
+    /// Headers stay `is_selectable` for keyboard activation (Enter toggles a
+    /// section / activates a repository) but are never auto-selected — matches
+    /// upstream semantics where collapsing a section leaves no selection.
+    fn is_primary_selectable(&self) -> bool {
+        matches!(
+            self,
+            GitListEntry::Status(_) | GitListEntry::TreeStatus(_) | GitListEntry::Directory(_)
+        )
+    }
+
     fn is_stageable(&self) -> bool {
         matches!(
             self,
@@ -2663,7 +2674,7 @@ impl GitPanel {
         let is_selectable = |index| {
             self.entries
                 .get(index)
-                .is_some_and(GitListEntry::is_selectable)
+                .is_some_and(GitListEntry::is_primary_selectable)
         };
         let first_entry = match &self.view_mode {
             GitPanelViewMode::Flat => self
@@ -2795,7 +2806,7 @@ impl GitPanel {
             .find(|&ix| {
                 self.entries
                     .get(ix)
-                    .is_some_and(GitListEntry::is_selectable)
+                    .is_some_and(GitListEntry::is_primary_selectable)
             });
 
         if let Some(last_entry) = last_entry {
@@ -11552,7 +11563,7 @@ mod tests {
         repository::repo_path,
         status::{StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode},
     };
-    use gpui::{Modifiers, TestAppContext, UpdateGlobal, VisualTestContext, px};
+    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext, px};
     use indoc::indoc;
     use project::FakeFs;
     use search::{BufferSearchBar, buffer_search::Deploy};
@@ -12571,7 +12582,7 @@ mod tests {
         let panel = workspace.update_in(&mut cx, GitPanel::new);
         await_git_panel_entries(&panel, &mut cx).await;
 
-        let entries = panel.read_with(&mut cx, |panel, cx| {
+        let entries = panel.read_with(&mut cx, |panel, _cx| {
             assert_eq!(panel.entry_count, 6);
             assert_eq!(
                 panel
@@ -12588,7 +12599,7 @@ mod tests {
                 .projected_entries_by_path
                 .get(&ChangeKey {
                     repository_id: panel.active_repository_id.unwrap(),
-                    repo_path: partial_path,
+                    repo_path: partial_path.clone(),
                 })
                 .expect("partially staged entry should have projections");
             assert_eq!(
@@ -12604,13 +12615,7 @@ mod tests {
                     },
                 ]
             );
-            let repo_id = panel
-                .active_repository
-                .as_ref()
-                .expect("active repository should exist")
-                .read(cx)
-                .id;
-            let visible = panel.visible_selectable_entry_ids(repo_id);
+            let visible = panel.visible_selectable_entry_ids();
             let partial_ids = visible
                 .iter()
                 .filter(|entry| entry.path == partial_path)
@@ -12723,13 +12728,7 @@ mod tests {
                 panel.entry_by_path_in_section(&repo_path("partial.rs"), Section::Staged);
         });
 
-        panel.update_in(&mut cx, |panel, _window, cx| {
-            let repo_id = panel
-                .active_repository
-                .as_ref()
-                .expect("active repository should exist")
-                .read(cx)
-                .id;
+        panel.update_in(&mut cx, |panel, _window, _cx| {
             let staged_index = panel
                 .entry_by_path_in_section(&repo_path("partial.rs"), Section::Staged)
                 .expect("staged projection should exist");
@@ -17900,205 +17899,6 @@ mod tests {
                 Status(GitStatusEntry { staging: StageStatus::Unstaged, .. }),
             ],
         );
-    }
-    fn selection_test_entry(repo_id: u64, path: &str) -> GitPanelEntryId {
-        selection_test_entry_in_section(repo_id, path, None)
-    }
-
-    fn selection_test_entry_in_section(
-        repo_id: u64,
-        path: &str,
-        section: Option<Section>,
-    ) -> GitPanelEntryId {
-        GitPanelEntryId {
-            repo_id: RepositoryId(repo_id),
-            path: repo_path(path),
-            section,
-            kind: GitPanelEntryKind::Status,
-        }
-    }
-
-    #[test]
-    fn test_multi_selection_identity_includes_repository_and_projection() {
-        let first_repo = selection_test_entry(1, "src/lib.rs");
-        let second_repo = selection_test_entry(2, "src/lib.rs");
-        let staged_projection =
-            selection_test_entry_in_section(1, "src/lib.rs", Some(Section::Staged));
-        let unstaged_projection =
-            selection_test_entry_in_section(1, "src/lib.rs", Some(Section::Unstaged));
-
-        assert_ne!(first_repo, second_repo);
-        assert_ne!(first_repo, staged_projection);
-        assert_ne!(staged_projection, unstaged_projection);
-
-        let visible = vec![staged_projection.clone(), unstaged_projection.clone()];
-        let mut selected = Some(staged_projection.clone());
-        let mut marked = vec![staged_projection.clone()];
-        let mut anchor = Some(staged_projection);
-        update_selection(
-            &mut selected,
-            &mut marked,
-            &mut anchor,
-            &visible,
-            unstaged_projection,
-            true,
-            false,
-        );
-        assert_eq!(marked, visible);
-    }
-
-    #[test]
-    fn test_multi_selection_survives_refresh_reorder_and_removal() {
-        let first = selection_test_entry(1, "a.rs");
-        let removed = selection_test_entry(1, "b.rs");
-        let remaining = selection_test_entry(1, "c.rs");
-        let duplicate_path_other_repo = selection_test_entry(2, "a.rs");
-        let mut selected = Some(first.clone());
-        let mut marked = vec![
-            first.clone(),
-            removed,
-            remaining.clone(),
-            duplicate_path_other_repo.clone(),
-        ];
-        let mut anchor = Some(first.clone());
-
-        reconcile_selection(
-            &mut selected,
-            &mut marked,
-            &mut anchor,
-            &[
-                duplicate_path_other_repo.clone(),
-                remaining.clone(),
-                first.clone(),
-            ],
-        );
-
-        assert_eq!(selected, Some(first.clone()));
-        assert_eq!(
-            marked,
-            vec![duplicate_path_other_repo, remaining, first.clone()]
-        );
-        assert_eq!(anchor, Some(first));
-    }
-
-    #[test]
-    fn test_multi_selection_shift_click_selects_visible_range() {
-        let first = selection_test_entry(1, "a.rs");
-        let second = selection_test_entry(1, "b.rs");
-        let third = selection_test_entry(1, "c.rs");
-        let fourth = selection_test_entry(1, "d.rs");
-        let visible = vec![first.clone(), second, third, fourth.clone()];
-        let mut selected = Some(first.clone());
-        let mut marked = vec![first.clone()];
-        let mut anchor = Some(first.clone());
-
-        update_selection(
-            &mut selected,
-            &mut marked,
-            &mut anchor,
-            &visible,
-            fourth.clone(),
-            true,
-            false,
-        );
-
-        assert_eq!(selected, Some(fourth));
-        assert_eq!(marked, visible);
-        assert_eq!(anchor, Some(first));
-    }
-
-    #[test]
-    fn test_multi_selection_shift_click_prefers_current_selection_over_stale_anchor() {
-        let first = selection_test_entry(1, "a.rs");
-        let second = selection_test_entry(1, "b.rs");
-        let third = selection_test_entry(1, "c.rs");
-        let visible = vec![first.clone(), second.clone(), third.clone()];
-        let mut selected = Some(second.clone());
-        let mut marked = vec![second];
-        let mut anchor = Some(first);
-
-        update_selection(
-            &mut selected,
-            &mut marked,
-            &mut anchor,
-            &visible,
-            third,
-            true,
-            false,
-        );
-
-        assert_eq!(selected, Some(visible[2].clone()));
-        assert_eq!(marked, visible[1..].to_vec());
-        assert_eq!(anchor, Some(visible[1].clone()));
-    }
-    #[test]
-    fn test_multi_selection_shift_click_uses_selected_row_when_anchor_is_missing() {
-        let first = selection_test_entry(1, "a.rs");
-        let second = selection_test_entry(1, "b.rs");
-        let third = selection_test_entry(1, "c.rs");
-        let visible = vec![first, second.clone(), third.clone()];
-        let mut selected = Some(second.clone());
-        let mut marked = vec![second];
-        let mut anchor = None;
-
-        update_selection(
-            &mut selected,
-            &mut marked,
-            &mut anchor,
-            &visible,
-            third,
-            true,
-            false,
-        );
-
-        assert_eq!(selected, Some(visible[2].clone()));
-        assert_eq!(marked, visible[1..].to_vec());
-        assert_eq!(anchor, Some(visible[1].clone()));
-    }
-
-    #[test]
-    fn test_multi_selection_refresh_reanchors_after_selected_row_removal() {
-        let removed = selection_test_entry(1, "removed.rs");
-        let replacement = selection_test_entry(1, "replacement.rs");
-        let stale_anchor = selection_test_entry(1, "stale-anchor.rs");
-        let mut selected = Some(removed.clone());
-        let mut marked = vec![removed, replacement.clone()];
-        let mut anchor = Some(stale_anchor);
-
-        reconcile_selection(
-            &mut selected,
-            &mut marked,
-            &mut anchor,
-            std::slice::from_ref(&replacement),
-        );
-
-        assert_eq!(selected, Some(replacement.clone()));
-        assert_eq!(marked, vec![replacement.clone()]);
-        assert_eq!(anchor, Some(replacement));
-    }
-    #[test]
-    fn test_multi_selection_toggle_click_removes_only_target() {
-        let first = selection_test_entry(1, "a.rs");
-        let second = selection_test_entry(1, "b.rs");
-        let third = selection_test_entry(1, "c.rs");
-        let visible = vec![first.clone(), second.clone(), third.clone()];
-        let mut selected = Some(first.clone());
-        let mut marked = vec![first.clone(), second.clone(), third.clone()];
-        let mut anchor = Some(first.clone());
-
-        update_selection(
-            &mut selected,
-            &mut marked,
-            &mut anchor,
-            &visible,
-            second.clone(),
-            false,
-            true,
-        );
-
-        assert_eq!(selected, Some(second.clone()));
-        assert_eq!(marked, vec![first, third]);
-        assert_eq!(anchor, Some(second));
     }
 }
 
