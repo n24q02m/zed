@@ -795,7 +795,6 @@ fn update_selection(
     *selected = Some(target);
 }
 
-
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 struct ChangeKey {
     repository_id: RepositoryId,
@@ -2071,7 +2070,6 @@ impl GitPanel {
         self.mark_range(anchor_ix, target_ix);
     }
 
-
     fn repository_id_for_entry_index(&self, ix: usize) -> Option<RepositoryId> {
         debug_assert_eq!(self.entries.len(), self.entry_repository_ids.len());
         self.entry_repository_ids.get(ix).copied()
@@ -3301,10 +3299,8 @@ impl GitPanel {
                     if !staged.is_empty() {
                         this.change_file_stage_grouped(false, staged, cx);
                     }
-                    let mut tracked_by_repository: HashMap<
-                        RepositoryId,
-                        Vec<GitStatusEntry>,
-                    > = HashMap::default();
+                    let mut tracked_by_repository: HashMap<RepositoryId, Vec<GitStatusEntry>> =
+                        HashMap::default();
                     for (repository_id, entry) in entries
                         .iter()
                         .filter(|(_, entry)| !entry.status.is_created())
@@ -9875,10 +9871,13 @@ impl GitPanel {
             "Unstage File"
         };
         let entry_repository_id = self.repository_id_for_entry_index(ix);
-        if !self.marked_file_entries().iter().any(|(repository_id, marked)| {
-            Some(*repository_id) == entry_repository_id
-                && marked.repo_path == entry.repo_path
-        }) {
+        if !self
+            .marked_file_entries()
+            .iter()
+            .any(|(repository_id, marked)| {
+                Some(*repository_id) == entry_repository_id && marked.repo_path == entry.repo_path
+            })
+        {
             self.clear_marks();
         }
         self.selected_entry = Some(ix);
