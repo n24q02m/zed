@@ -360,7 +360,7 @@ impl CommitModal {
             is_generating,
         ) = self.git_panel.update(cx, |git_panel, cx| {
             let (can_commit, tooltip) = git_panel.configure_commit_button(cx);
-            let title = git_panel.commit_button_title();
+            let title = git_panel.commit_button_title(cx);
             let co_authors = git_panel.render_co_authors(cx);
             let generate_commit_message = git_panel.render_generate_commit_message_button(cx);
             let active_repo = git_panel.active_repository.clone();
@@ -456,12 +456,14 @@ impl CommitModal {
                             .disabled(!can_commit)
                             .child(Label::new(commit_label).size(LabelSize::Small).mr_0p5())
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                telemetry::event!("Git Committed", source = "Git Modal");
-                                this.git_panel.update(cx, |git_panel, cx| {
+                                let committed = this.git_panel.update(cx, |git_panel, cx| {
                                     let options = git_panel.commit_options();
                                     git_panel.commit_changes(options, window, cx)
                                 });
-                                cx.emit(DismissEvent);
+                                if committed {
+                                    telemetry::event!("Git Committed", source = "Git Modal");
+                                    cx.emit(DismissEvent);
+                                }
                             }))
                             .tooltip({
                                 let focus_handle = focus_handle.clone();
