@@ -73,7 +73,8 @@ jobs:
         shell: pwsh
         run: |
           cargo install cargo-about --locked
-          cargo about --version
+          Add-Content $env:GITHUB_PATH "$env:CARGO_HOME/bin"
+          & "$env:CARGO_HOME/bin/cargo-about.exe" --version
 
       - name: Bundle unsigned Windows application
         shell: pwsh
