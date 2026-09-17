@@ -72,7 +72,7 @@ jobs:
       - name: Install cargo-about for license bundling
         shell: pwsh
         run: |
-          cargo install cargo-about --locked
+          cargo install cargo-about --locked --features cli
           Add-Content $env:GITHUB_PATH "$env:CARGO_HOME/bin"
           & "$env:CARGO_HOME/bin/cargo-about.exe" --version
 
